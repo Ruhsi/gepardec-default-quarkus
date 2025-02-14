@@ -142,7 +142,7 @@
                         <groupId>io.github.pmckeown</groupId>
                         <artifactId>dependency-track-maven-plugin</artifactId>
                         <inherited>false</inherited>
-                        <version>1.7.0</version>
+                        <version>1.9.1</version>
                         <configuration>
                             <dependencyTrackBaseUrl>http://localhost:8081</dependencyTrackBaseUrl>
                             <apiKey>odt_co9wIqIu9HlcrHz6flOAXjtaplGZ5WPh</apiKey>
