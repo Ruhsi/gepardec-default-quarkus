@@ -95,3 +95,19 @@ python3 .github/scripts/renovate_step2_analyze_changes.py \
   --md-out step2-result.md
 ```
 
+Step 3 maps dependency changes to affected source files and concrete code edits.
+
+- Workflow: `.github/workflows/renovate-ai-step3-impact-analysis.yml`
+- Script: `.github/scripts/renovate_step3_analyze_impact.py`
+- Goal: list impacted classes and suggested migration changes
+
+Run Step 3 locally (after Step 2):
+
+```bash
+python3 .github/scripts/renovate_step3_analyze_impact.py \
+  --repo-root . \
+  --step2-json step2-result.json \
+  --json-out step3-result.json \
+  --md-out step3-result.md
+```
+
