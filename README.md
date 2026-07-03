@@ -60,3 +60,21 @@ If you want to learn more about building native executables, please consult <htt
 Easily start your Reactive RESTful Web Services
 
 [Related guide section...](https://quarkus.io/guides/getting-started-reactive#reactive-jax-rs-resources)
+
+## Renovate AI migration pilot
+
+The repository now includes the first pipeline step for a repeatable Renovate + AI migration flow.
+
+- Workflow: `.github/workflows/renovate-ai-step1-showcase.yml`
+- Script: `.github/scripts/renovate_step1_showcase.py`
+- Goal: verify that `junit:junit` is a good showcase dependency (test-only with JUnit4 usage)
+
+Run the scan locally:
+
+```bash
+python3 .github/scripts/renovate_step1_showcase.py \
+  --repo-root . \
+  --json-out showcase-result.json \
+  --md-out showcase-result.md
+```
+

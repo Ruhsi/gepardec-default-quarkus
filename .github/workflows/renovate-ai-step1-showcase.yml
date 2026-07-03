@@ -1,0 +1,56 @@
+name: Renovate AI Step 1 Showcase
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  scan-showcase:
+    if: startsWith(github.head_ref, 'renovate/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan repository for step 1 showcase dependency
+        id: scan
+        run: |
+          python3 .github/scripts/renovate_step1_showcase.py \
+            --repo-root . \
+            --json-out showcase-result.json \
+            --md-out showcase-result.md | tee showcase-stdout.txt
+
+          # Export selected values as step outputs
+          while IFS='=' read -r key value; do
+            if [ -n "$key" ] && [ -n "$value" ]; then
+              echo "$key=$value" >> "$GITHUB_OUTPUT"
+            fi
+          done < <(grep -E '^(candidate|dependency|version|scope)=' showcase-stdout.txt)
+
+      - name: Upload showcase scan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: renovate-ai-step1-showcase
+          path: |
+            showcase-result.json
+            showcase-result.md
+
+      - name: Comment result to pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('showcase-result.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
