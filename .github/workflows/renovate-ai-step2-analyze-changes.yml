@@ -1,0 +1,100 @@
+name: Renovate AI Step 2 Analyze Changes
+
+on:
+  workflow_dispatch:
+    inputs:
+      dependency:
+        description: "Dependency in groupId:artifactId format"
+        required: true
+        default: "junit:junit"
+      oldVersion:
+        description: "Old dependency version"
+        required: true
+      newVersion:
+        description: "New dependency version"
+        required: true
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  analyze-changes:
+    if: startsWith(github.head_ref, 'renovate/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Resolve dependency versions for pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "dependency=junit:junit" >> "$GITHUB_ENV"
+          git show "${{ github.event.pull_request.base.sha }}:pom.xml" > pom-base.xml
+
+      - name: Resolve dependency versions for workflow dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "dependency=${{ inputs.dependency }}" >> "$GITHUB_ENV"
+          echo "oldVersion=${{ inputs.oldVersion }}" >> "$GITHUB_ENV"
+          echo "newVersion=${{ inputs.newVersion }}" >> "$GITHUB_ENV"
+
+      - name: Analyze dependency changes
+        id: analyze
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            python3 .github/scripts/renovate_step2_analyze_changes.py \
+              --dependency "$dependency" \
+              --base-pom pom-base.xml \
+              --head-pom pom.xml \
+              --json-out step2-result.json \
+              --md-out step2-result.md | tee step2-stdout.txt
+          else
+            python3 .github/scripts/renovate_step2_analyze_changes.py \
+              --dependency "$dependency" \
+              --old-version "$oldVersion" \
+              --new-version "$newVersion" \
+              --head-pom pom.xml \
+              --json-out step2-result.json \
+              --md-out step2-result.md | tee step2-stdout.txt
+          fi
+
+          while IFS='=' read -r key value; do
+            if [ -n "$key" ] && [ -n "$value" ]; then
+              echo "$key=$value" >> "$GITHUB_OUTPUT"
+            fi
+          done < <(grep -E '^(dependency|oldVersion|newVersion|modifiedClasses|addedClasses|removedClasses)=' step2-stdout.txt)
+
+      - name: Upload step 2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: renovate-ai-step2-analysis
+          path: |
+            step2-result.json
+            step2-result.md
+
+      - name: Comment result to pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('step2-result.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+

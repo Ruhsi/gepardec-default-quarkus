@@ -78,3 +78,20 @@ python3 .github/scripts/renovate_step1_showcase.py \
   --md-out showcase-result.md
 ```
 
+Step 2 analyzes dependency changes between old and new versions.
+
+- Workflow: `.github/workflows/renovate-ai-step2-analyze-changes.yml`
+- Script: `.github/scripts/renovate_step2_analyze_changes.py`
+- Goal: produce API and dependency tree deltas between two versions
+
+Run Step 2 locally:
+
+```bash
+python3 .github/scripts/renovate_step2_analyze_changes.py \
+  --dependency junit:junit \
+  --old-version 4.12 \
+  --new-version 4.13.2 \
+  --json-out step2-result.json \
+  --md-out step2-result.md
+```
+
