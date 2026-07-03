@@ -133,3 +133,20 @@ Apply recipe locally:
   -Drewrite.activeRecipes=org.acme.renovate.Step4ImpactMigration
 ```
 
+Step 5 generates a PR-ready summary describing what changed, why, and where it impacts the application.
+
+- Script: `.github/scripts/renovate_step5_generate_summary.py`
+- Outputs: `step5-summary.json`, `step5-summary.md`
+- Integration: executed by `.github/workflows/renovate-ai-step4-apply-recipe.yml`
+
+Run Step 5 locally (after Step 2-4 outputs exist):
+
+```bash
+python3 .github/scripts/renovate_step5_generate_summary.py \
+  --step2-json step2-result.json \
+  --step3-json step3-result.json \
+  --diff-file step4-changes.diff \
+  --json-out step5-summary.json \
+  --md-out step5-summary.md
+```
+

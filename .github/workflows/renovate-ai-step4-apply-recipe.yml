@@ -92,6 +92,22 @@ jobs:
           git status --short
           git diff > step4-changes.diff
 
+      - name: Generate Step 5 migration summary
+        id: step5
+        run: |
+          python3 .github/scripts/renovate_step5_generate_summary.py \
+            --step2-json step2-result.json \
+            --step3-json step3-result.json \
+            --diff-file step4-changes.diff \
+            --json-out step5-summary.json \
+            --md-out step5-summary.md | tee step5-stdout.txt
+
+          while IFS='=' read -r key value; do
+            if [ -n "$key" ] && [ -n "$value" ]; then
+              echo "$key=$value" >> "$GITHUB_OUTPUT"
+            fi
+          done < <(grep -E '^(dependency|oldVersion|newVersion|summaryFiles|summaryImpacted)=' step5-stdout.txt)
+
       - name: Upload step 4 artifact
         uses: actions/upload-artifact@v4
         with:
@@ -102,6 +118,8 @@ jobs:
             step3-result.json
             step3-result.md
             step4-changes.diff
+            step5-summary.json
+            step5-summary.md
 
       - name: Commit and push changes
         if: github.event_name == 'pull_request'
@@ -120,19 +138,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const step3 = fs.readFileSync('step3-result.md', 'utf8');
-            const diff = fs.readFileSync('step4-changes.diff', 'utf8');
-            const body = [
-              '# Renovate AI Step 4 - Applied OpenRewrite Recipe',
-              '',
-              '## Impact analysis',
-              step3,
-              '',
-              '## Diff preview (first 200 lines)',
-              '```diff',
-              diff.split('\n').slice(0, 200).join('\n'),
-              '```'
-            ].join('\n');
+            const body = fs.readFileSync('step5-summary.md', 'utf8');
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
