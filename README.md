@@ -111,3 +111,25 @@ python3 .github/scripts/renovate_step3_analyze_impact.py \
   --md-out step3-result.md
 ```
 
+Step 4 applies an OpenRewrite recipe for the detected impact.
+
+- Workflow: `.github/workflows/renovate-ai-step4-apply-recipe.yml`
+- Recipe file: `rewrite-step4.yml`
+- Active recipe: `org.acme.renovate.Step4ImpactMigration`
+
+Validate recipe resolution locally (dry run):
+
+```bash
+./mvnw -B rewrite:dryRun \
+  -Drewrite.configLocation=rewrite-step4.yml \
+  -Drewrite.activeRecipes=org.acme.renovate.Step4ImpactMigration
+```
+
+Apply recipe locally:
+
+```bash
+./mvnw -B rewrite:run \
+  -Drewrite.configLocation=rewrite-step4.yml \
+  -Drewrite.activeRecipes=org.acme.renovate.Step4ImpactMigration
+```
+

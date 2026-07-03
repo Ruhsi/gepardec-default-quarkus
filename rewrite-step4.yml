@@ -1,0 +1,25 @@
+type: specs.openrewrite.org/v1beta/recipe
+name: org.acme.renovate.Step4ImpactMigration
+displayName: Step 4 impact migration for JUnit4 to JUnit5
+recipeList:
+  # Full migration recipe from OpenRewrite's testing framework bundle.
+  - org.openrewrite.java.testing.junit5.JUnit4to5Migration
+  # Keep the resulting tests aligned with JUnit5 best practices.
+  - org.openrewrite.java.testing.junit5.JUnit5BestPractices
+  # Explicit type migrations for common JUnit4 symbols detected in Step 3.
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.junit.Before
+      newFullyQualifiedTypeName: org.junit.jupiter.api.BeforeEach
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.junit.After
+      newFullyQualifiedTypeName: org.junit.jupiter.api.AfterEach
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.junit.Test
+      newFullyQualifiedTypeName: org.junit.jupiter.api.Test
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.junit.Ignore
+      newFullyQualifiedTypeName: org.junit.jupiter.api.Disabled
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.junit.Assert
+      newFullyQualifiedTypeName: org.junit.jupiter.api.Assertions
+
