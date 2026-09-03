@@ -1,4 +1,4 @@
-name: PR 05 - Map incompatible Maven API usages
+name: PR 05 - Map incompatible and removed Maven API usages
 
 on:
   pull_request:
@@ -23,6 +23,7 @@ env:
   JAPICMP_SHA256: "419ebc0d8ac5cc1e11c9961ada2eeb7136dc054de6a43cafff3207504d85da23"
   JAPICMP_PAIR_TIMEOUT_SECONDS: "180"
   MAX_JAVA_SOURCE_FILES: "20000"
+  MAX_REMOVED_DEPENDENCY_TYPE_TARGETS: "30000"
   JAVA_USAGE_ANALYZER_MAX_HEAP: "2048m"
   JAVA_USAGE_ANALYZER_SHA256: "b597e3371f270717e53e78a663795e46e6046b1741f08da9751504db99765673"
 
@@ -2156,35 +2157,127 @@ jobs:
               handle.write("No changed Java bytecode JAR pairs were selected.\n")
           PY
 
-      - name: Create incompatible API source-usage plan
+      - name: Ensure dependency JAR classpaths for source impact
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/pr-change
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          relevant_change_count="$({
+            OUTPUT_DIR="${OUTPUT_DIR}" python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          changes = json.loads(
+              (Path(os.environ["OUTPUT_DIR"]) / "dependency-changes.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          print(
+              sum(
+                  1
+                  for change in changes.get("changes", [])
+                  if change.get("type", "jar") == "jar"
+                  and change.get("changeType") in {"REMOVED", "ADDED"}
+              )
+          )
+          PY
+          })"
+
+          if [[ "${relevant_change_count}" == "0" ]]; then
+            exit 0
+          fi
+
+          resolved_root="${RUNNER_TEMP}/resolved-jars"
+          mkdir -p -- "${resolved_root}/base" "${resolved_root}/head"
+
+          resolve_if_missing() {
+            local label="$1"
+            local project_dir="$2"
+            local destination="$3"
+
+            if find "${destination}" -type f -name '*.jar' -print -quit 2>/dev/null | grep -q .; then
+              echo "${label} dependency JAR classpath already resolved."
+              return 0
+            fi
+
+            local -a mvn_command
+            if [[ -f "${project_dir}/mvnw" ]]; then
+              chmod +x "${project_dir}/mvnw"
+              mvn_command=("./mvnw")
+            else
+              mvn_command=("mvn")
+            fi
+
+            echo "::group::Resolve ${label} JAR files for source-impact analysis"
+            (
+              cd "${project_dir}"
+              "${mvn_command[@]}" \
+                -B \
+                -ntp \
+                -Dstyle.color=never \
+                -DskipTests \
+                "org.apache.maven.plugins:maven-dependency-plugin:${MAVEN_DEPENDENCY_PLUGIN_VERSION}:copy-dependencies" \
+                "-DoutputDirectory=${destination}" \
+                -DincludeTypes=jar \
+                -DincludeScope=test \
+                -Dmdep.useRepositoryLayout=true \
+                -Dmdep.useBaseVersion=true \
+                -Dmdep.stripVersion=false \
+                -Dmdep.stripClassifier=false
+            )
+            echo "::endgroup::"
+          }
+
+          resolve_if_missing \
+            "base" \
+            "${RUNNER_TEMP}/dependency-base" \
+            "${resolved_root}/base"
+
+          resolve_if_missing \
+            "head" \
+            "${RUNNER_TEMP}/dependency-head" \
+            "${resolved_root}/head"
+
+      - name: Create complete Java source-usage plan
         id: usage-plan
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/pr-change
           SOURCE_ROOT: ${{ runner.temp }}/dependency-head
           RESOLVED_BASE: ${{ runner.temp }}/resolved-jars/base
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RESOLVED_HEAD: ${{ runner.temp }}/resolved-jars/head
         run: |
           set -euo pipefail
 
           OUTPUT_DIR="${OUTPUT_DIR}" \
           SOURCE_ROOT="${SOURCE_ROOT}" \
           RESOLVED_BASE="${RESOLVED_BASE}" \
-          HEAD_SHA="${HEAD_SHA}" \
+          RESOLVED_HEAD="${RESOLVED_HEAD}" \
           MAX_JAVA_SOURCE_FILES="${MAX_JAVA_SOURCE_FILES}" \
+          MAX_REMOVED_DEPENDENCY_TYPE_TARGETS="${MAX_REMOVED_DEPENDENCY_TYPE_TARGETS}" \
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}" \
           python3 <<'PY'
           import base64
           import hashlib
           import json
           import os
+          import re
+          import zipfile
           from collections import Counter
           from pathlib import Path
 
           output_dir = Path(os.environ["OUTPUT_DIR"])
           source_root = Path(os.environ["SOURCE_ROOT"]).resolve()
           resolved_base = Path(os.environ["RESOLVED_BASE"]).resolve()
+          resolved_head = Path(os.environ["RESOLVED_HEAD"]).resolve()
           max_source_files = int(os.environ["MAX_JAVA_SOURCE_FILES"])
+          max_removed_targets = int(os.environ["MAX_REMOVED_DEPENDENCY_TYPE_TARGETS"])
           list_separator = "\x1f"
+          production_scopes = {"compile", "runtime", "provided", "system"}
 
 
           def sha256(path):
@@ -2230,68 +2323,82 @@ jobs:
               return ""
 
 
-          incompatible = json.loads(
-              (output_dir / "api-incompatible-changes.json").read_text(
-                  encoding="utf-8"
-              )
-          )
-          metadata = json.loads(
-              (output_dir / "metadata.json").read_text(encoding="utf-8")
-          )
+          def scope_category(scopes):
+              scopes = set(scopes)
+              has_production = bool(scopes & production_scopes)
+              has_test = "test" in scopes
+              if has_production and has_test:
+                  return "MIXED"
+              if has_production:
+                  return "PRODUCTION"
+              if has_test:
+                  return "TEST_ONLY"
+              return "OTHER"
 
-          targets = []
-          target_rows = []
-          for change in incompatible.get("changes", []):
-              if change.get("binaryCompatible", True) and change.get(
-                  "sourceCompatible", True
-              ):
-                  continue
 
+          def coordinate(group_id, artifact_id, artifact_type, classifier):
+              value = f"{group_id}:{artifact_id}:{artifact_type}"
+              if classifier:
+                  value += f":{classifier}"
+              return value
+
+
+          def repository_path(group_id, artifact_id, version, classifier):
+              group_path = group_id.replace(".", "/")
+              filename = f"{artifact_id}-{version}"
+              if classifier:
+                  filename += f"-{classifier}"
+              filename += ".jar"
+              return Path(group_path) / artifact_id / version / filename
+
+
+          def logical_class_name(entry_name):
+              name = entry_name
+              if name.startswith("META-INF/versions/"):
+                  parts = name.split("/", 3)
+                  if len(parts) != 4 or not parts[2].isdigit():
+                      return None
+                  name = parts[3]
+              elif name.startswith("META-INF/"):
+                  return None
+
+              if not name.endswith(".class"):
+                  return None
+
+              class_path = name[:-6]
+              leaf = class_path.rsplit("/", 1)[-1]
+              if leaf in {"module-info", "package-info"}:
+                  return None
+              if re.search(r"\$\d+(?:$|\$)", leaf):
+                  return None
+              if "$$Lambda$" in leaf:
+                  return None
+
+              return class_path.replace("/", ".")
+
+
+          def jar_class_names(path):
+              names = set()
+              with zipfile.ZipFile(path) as archive:
+                  for entry in archive.namelist():
+                      class_name = logical_class_name(entry)
+                      if class_name:
+                          names.add(class_name)
+              return sorted(names)
+
+
+          def add_target(target):
               identity = "\0".join(
                   (
-                      change["coordinate"],
-                      change["kind"],
-                      change["signature"],
+                      target["targetOrigin"],
+                      target["coordinate"],
+                      target["kind"],
+                      target["signature"],
                   )
               )
               target_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-              compatibility_types = sorted(
-                  {
-                      item["type"]
-                      for item in change.get("compatibilityChanges", [])
-                      if item.get("type")
-                  }
-              )
-
-              target = {
-                  "targetId": target_id,
-                  "coordinate": change["coordinate"],
-                  "groupId": change["groupId"],
-                  "artifactId": change["artifactId"],
-                  "classifier": change.get("classifier", ""),
-                  "oldVersion": change["oldVersion"],
-                  "newVersion": change["newVersion"],
-                  "dependencyScopeCategory": change["scopeCategory"],
-                  "analysisMode": change["analysisMode"],
-                  "kind": change["kind"],
-                  "className": change["className"],
-                  "name": change["name"],
-                  "parameters": change.get("parameters", []),
-                  "signature": change["signature"],
-                  "changeStatus": change["changeStatus"],
-                  "binaryCompatible": change["binaryCompatible"],
-                  "sourceCompatible": change["sourceCompatible"],
-                  "compatibilityTypes": compatibility_types,
-                  "reportPath": change["reportPath"],
-                  "markdownReportPath": change["markdownReportPath"],
-                  "matchStrategy": (
-                      "TYPE_REFERENCE"
-                      if change["kind"] == "CLASS"
-                      else "RESOLVED_JAVA_SYMBOL"
-                  ),
-              }
+              target["targetId"] = target_id
               targets.append(target)
-
               target_rows.append(
                   "\t".join(
                       (
@@ -2318,14 +2425,6 @@ jobs:
                   )
               )
 
-          targets.sort(
-              key=lambda item: (
-                  item["coordinate"],
-                  item["signature"],
-                  item["targetId"],
-              )
-          )
-          target_rows.sort()
 
           source_markers = (
               "/src/main/java/",
@@ -2375,7 +2474,6 @@ jobs:
                   }
               )
 
-          classpath_entries = []
           classpath_paths = []
           if resolved_base.is_dir():
               classpath_paths = sorted(
@@ -2383,44 +2481,326 @@ jobs:
                   key=lambda path: path.relative_to(resolved_base).as_posix(),
               )
 
-          for path in classpath_paths:
-              classpath_entries.append(
+          classpath_entries = [
+              {
+                  "path": path.relative_to(resolved_base).as_posix(),
+                  "sizeBytes": path.stat().st_size,
+                  "sha256": sha256(path),
+              }
+              for path in classpath_paths
+          ]
+
+          incompatible = json.loads(
+              (output_dir / "api-incompatible-changes.json").read_text(encoding="utf-8")
+          )
+          dependency_changes = json.loads(
+              (output_dir / "dependency-changes.json").read_text(encoding="utf-8")
+          )
+          metadata = json.loads(
+              (output_dir / "metadata.json").read_text(encoding="utf-8")
+          )
+
+          targets = []
+          target_rows = []
+
+          # 1) Existing Step-4A JApiCmp findings for VERSION_CHANGED dependencies.
+          for change in incompatible.get("changes", []):
+              if change.get("binaryCompatible", True) and change.get("sourceCompatible", True):
+                  continue
+
+              compatibility_types = sorted(
                   {
-                      "path": path.relative_to(resolved_base).as_posix(),
-                      "sizeBytes": path.stat().st_size,
-                      "sha256": sha256(path),
+                      item["type"]
+                      for item in change.get("compatibilityChanges", [])
+                      if item.get("type")
+                  }
+              )
+              add_target(
+                  {
+                      "targetOrigin": "JAPICMP_INCOMPATIBLE_API",
+                      "dependencyChangeType": "VERSION_CHANGED",
+                      "coordinate": change["coordinate"],
+                      "groupId": change["groupId"],
+                      "artifactId": change["artifactId"],
+                      "classifier": change.get("classifier", ""),
+                      "oldVersion": change["oldVersion"],
+                      "newVersion": change["newVersion"],
+                      "dependencyScopeCategory": change["scopeCategory"],
+                      "analysisMode": change["analysisMode"],
+                      "kind": change["kind"],
+                      "className": change["className"],
+                      "name": change["name"],
+                      "parameters": change.get("parameters", []),
+                      "signature": change["signature"],
+                      "changeStatus": change["changeStatus"],
+                      "binaryCompatible": change["binaryCompatible"],
+                      "sourceCompatible": change["sourceCompatible"],
+                      "compatibilityTypes": compatibility_types,
+                      "reportPath": change["reportPath"],
+                      "markdownReportPath": change["markdownReportPath"],
+                      "matchStrategy": (
+                          "TYPE_REFERENCE"
+                          if change["kind"] == "CLASS"
+                          else "RESOLVED_JAVA_SYMBOL"
+                      ),
                   }
               )
 
+          removed_dependencies = []
+          removed_type_target_count = 0
+          removed_inventory_failures = []
+
+          # 2) Removed JARs do not have a new JAR for JApiCmp. Enumerate their
+          #    class names only and let the Java compiler resolve actual usages
+          #    against the old classpath. No classfile bytecode is inspected.
+          for change in dependency_changes.get("changes", []):
+              if change.get("changeType") != "REMOVED" or change.get("type", "jar") != "jar":
+                  continue
+
+              old = change.get("old") or {}
+              versions = [str(value) for value in old.get("versions", [])]
+              if len(versions) != 1:
+                  removed_inventory_failures.append(
+                      {
+                          "reason": "AMBIGUOUS_OLD_VERSION",
+                          "groupId": change.get("groupId"),
+                          "artifactId": change.get("artifactId"),
+                          "classifier": change.get("classifier") or "",
+                          "versions": versions,
+                      }
+                  )
+                  continue
+
+              group_id = str(change["groupId"])
+              artifact_id = str(change["artifactId"])
+              classifier = str(change.get("classifier") or "")
+              old_version = versions[0]
+              scopes = sorted(str(value) for value in old.get("scopes", []))
+              repo_path = repository_path(
+                  group_id, artifact_id, old_version, classifier
+              )
+              jar_path = resolved_base / repo_path
+              dep_coordinate = coordinate(
+                  group_id, artifact_id, "jar", classifier
+              )
+
+              if not jar_path.is_file():
+                  removed_inventory_failures.append(
+                      {
+                          "reason": "OLD_JAR_NOT_FOUND",
+                          "coordinate": dep_coordinate,
+                          "version": old_version,
+                          "expectedPath": repo_path.as_posix(),
+                      }
+                  )
+                  continue
+
+              try:
+                  class_names = jar_class_names(jar_path)
+              except (OSError, zipfile.BadZipFile) as exc:
+                  removed_inventory_failures.append(
+                      {
+                          "reason": "OLD_JAR_CLASS_INDEX_FAILED",
+                          "coordinate": dep_coordinate,
+                          "version": old_version,
+                          "message": str(exc),
+                      }
+                  )
+                  continue
+
+              removed_dependencies.append(
+                  {
+                      "coordinate": dep_coordinate,
+                      "groupId": group_id,
+                      "artifactId": artifact_id,
+                      "classifier": classifier,
+                      "oldVersion": old_version,
+                      "scopes": scopes,
+                      "scopeCategory": scope_category(scopes),
+                      "direct": bool(old.get("direct")),
+                      "repositoryPath": repo_path.as_posix(),
+                      "jarSha256": sha256(jar_path),
+                      "classCount": len(class_names),
+                      "classNames": class_names,
+                  }
+              )
+
+              for class_name in class_names:
+                  removed_type_target_count += 1
+                  if removed_type_target_count > max_removed_targets:
+                      raise ValueError(
+                          "Refusing to analyze more than "
+                          f"{max_removed_targets} types from removed dependencies"
+                      )
+                  add_target(
+                      {
+                          "targetOrigin": "REMOVED_DEPENDENCY_TYPE",
+                          "dependencyChangeType": "REMOVED",
+                          "coordinate": dep_coordinate,
+                          "groupId": group_id,
+                          "artifactId": artifact_id,
+                          "classifier": classifier,
+                          "oldVersion": old_version,
+                          "newVersion": "",
+                          "dependencyScopeCategory": scope_category(scopes),
+                          "analysisMode": "REMOVED_DEPENDENCY_TYPE_SCAN",
+                          "kind": "CLASS",
+                          "className": class_name,
+                          "name": class_name.rsplit(".", 1)[-1],
+                          "parameters": [],
+                          "signature": class_name,
+                          "changeStatus": "REMOVED",
+                          "binaryCompatible": False,
+                          "sourceCompatible": False,
+                          "compatibilityTypes": ["DEPENDENCY_REMOVED"],
+                          "reportPath": "removed-dependency-type-index.json",
+                          "markdownReportPath": "",
+                          "matchStrategy": "TYPE_REFERENCE",
+                      }
+                  )
+
+          # 3) Index classes from ADDED dependencies as a deterministic pool for
+          #    the later replacement-planning step. We deliberately do not map
+          #    old types to new types here.
+          added_dependencies = []
+          added_inventory_failures = []
+          for change in dependency_changes.get("changes", []):
+              if change.get("changeType") != "ADDED" or change.get("type", "jar") != "jar":
+                  continue
+
+              new = change.get("new") or {}
+              versions = [str(value) for value in new.get("versions", [])]
+              if len(versions) != 1:
+                  added_inventory_failures.append(
+                      {
+                          "reason": "AMBIGUOUS_NEW_VERSION",
+                          "groupId": change.get("groupId"),
+                          "artifactId": change.get("artifactId"),
+                          "classifier": change.get("classifier") or "",
+                          "versions": versions,
+                      }
+                  )
+                  continue
+
+              group_id = str(change["groupId"])
+              artifact_id = str(change["artifactId"])
+              classifier = str(change.get("classifier") or "")
+              new_version = versions[0]
+              scopes = sorted(str(value) for value in new.get("scopes", []))
+              repo_path = repository_path(
+                  group_id, artifact_id, new_version, classifier
+              )
+              jar_path = resolved_head / repo_path
+              dep_coordinate = coordinate(
+                  group_id, artifact_id, "jar", classifier
+              )
+
+              if not jar_path.is_file():
+                  added_inventory_failures.append(
+                      {
+                          "reason": "NEW_JAR_NOT_FOUND",
+                          "coordinate": dep_coordinate,
+                          "version": new_version,
+                          "expectedPath": repo_path.as_posix(),
+                      }
+                  )
+                  continue
+
+              try:
+                  class_names = jar_class_names(jar_path)
+              except (OSError, zipfile.BadZipFile) as exc:
+                  added_inventory_failures.append(
+                      {
+                          "reason": "NEW_JAR_CLASS_INDEX_FAILED",
+                          "coordinate": dep_coordinate,
+                          "version": new_version,
+                          "message": str(exc),
+                      }
+                  )
+                  continue
+
+              added_dependencies.append(
+                  {
+                      "coordinate": dep_coordinate,
+                      "groupId": group_id,
+                      "artifactId": artifact_id,
+                      "classifier": classifier,
+                      "newVersion": new_version,
+                      "scopes": scopes,
+                      "scopeCategory": scope_category(scopes),
+                      "direct": bool(new.get("direct")),
+                      "repositoryPath": repo_path.as_posix(),
+                      "jarSha256": sha256(jar_path),
+                      "classCount": len(class_names),
+                      "classNames": class_names,
+                  }
+              )
+
+          targets.sort(
+              key=lambda item: (
+                  item["targetOrigin"],
+                  item["coordinate"],
+                  item["signature"],
+                  item["targetId"],
+              )
+          )
+          target_rows.sort()
+          removed_dependencies.sort(key=lambda item: item["coordinate"])
+          added_dependencies.sort(key=lambda item: item["coordinate"])
+          removed_inventory_failures.sort(
+              key=lambda item: (
+                  item.get("coordinate") or "",
+                  item.get("groupId") or "",
+                  item.get("artifactId") or "",
+                  item["reason"],
+              )
+          )
+          added_inventory_failures.sort(
+              key=lambda item: (
+                  item.get("coordinate") or "",
+                  item.get("groupId") or "",
+                  item.get("artifactId") or "",
+                  item["reason"],
+              )
+          )
+
           if targets and not classpath_paths:
               raise ValueError(
-                  "Incompatible API targets exist, but the old resolved dependency "
+                  "Java API usage targets exist, but the old resolved dependency "
                   "classpath is empty"
               )
 
-          source_set_counts = Counter(
-              item["sourceSet"] for item in source_manifest
-          )
+          source_set_counts = Counter(item["sourceSet"] for item in source_manifest)
           target_kind_counts = Counter(item["kind"] for item in targets)
+          target_origin_counts = Counter(item["targetOrigin"] for item in targets)
 
           plan = {
-              "schemaVersion": 1,
-              "source": "api-incompatible-changes.json",
+              "schemaVersion": 2,
+              "sources": [
+                  "api-incompatible-changes.json",
+                  "dependency-changes.json",
+              ],
               "analysis": {
                   "engine": "JDK_COMPILER_AST_TYPE_ATTRIBUTION",
                   "bytecodeInspection": False,
+                  "jarInspection": "CLASS_ENTRY_NAMES_ONLY",
                   "sourceLanguage": "JAVA",
                   "sourceSnapshot": "PR_HEAD",
                   "sourceSha": os.environ["HEAD_SHA"],
                   "symbolClasspathSnapshot": "PR_COMPARISON_BASE",
                   "symbolClasspathSha": metadata["base"]["comparisonSha"],
                   "reasonForOldClasspath": (
-                      "Removed and changed API symbols must be resolved against "
-                      "the dependency versions that still contain them."
+                      "Removed APIs and types from removed dependencies must be "
+                      "resolved against dependency versions that still contain them."
                   ),
                   "annotationProcessing": False,
-                  "selection": (
-                      "binaryCompatible == false OR sourceCompatible == false"
+                  "selection": [
+                      "JApiCmp: binaryCompatible == false OR sourceCompatible == false",
+                      "Maven: all source-addressable class entries from REMOVED JAR dependencies",
+                  ],
+                  "addedDependencyHandling": (
+                      "Class names from ADDED JAR dependencies are indexed as a "
+                      "replacement candidate pool only; no replacement is inferred."
                   ),
                   "supportedUsages": [
                       "METHOD_INVOCATION",
@@ -2443,12 +2823,31 @@ jobs:
               },
               "limits": {
                   "maxJavaSourceFiles": max_source_files,
+                  "maxRemovedDependencyTypeTargets": max_removed_targets,
               },
               "summary": {
                   "targetCount": len(targets),
+                  "japicmpTargetCount": target_origin_counts.get(
+                      "JAPICMP_INCOMPATIBLE_API", 0
+                  ),
+                  "removedDependencyTypeTargetCount": target_origin_counts.get(
+                      "REMOVED_DEPENDENCY_TYPE", 0
+                  ),
+                  "removedDependencyCount": len(removed_dependencies),
+                  "removedDependencyInventoryFailureCount": len(
+                      removed_inventory_failures
+                  ),
+                  "addedDependencyCount": len(added_dependencies),
+                  "addedDependencyInventoryFailureCount": len(
+                      added_inventory_failures
+                  ),
+                  "addedDependencyTypeCount": sum(
+                      item["classCount"] for item in added_dependencies
+                  ),
                   "sourceFileCount": len(source_manifest),
                   "classpathEntryCount": len(classpath_entries),
                   "targetKindCounts": dict(sorted(target_kind_counts.items())),
+                  "targetOriginCounts": dict(sorted(target_origin_counts.items())),
                   "sourceSetCounts": dict(sorted(source_set_counts.items())),
               },
               "targets": targets,
@@ -2462,6 +2861,64 @@ jobs:
               "\n".join(target_rows) + ("\n" if target_rows else ""),
               encoding="utf-8",
           )
+          (output_dir / "removed-dependency-type-index.json").write_text(
+              json.dumps(
+                  {
+                      "schemaVersion": 1,
+                      "selection": "REMOVED Maven dependencies of type jar",
+                      "bytecodeInspection": False,
+                      "count": len(removed_dependencies),
+                      "typeCount": sum(
+                          item["classCount"] for item in removed_dependencies
+                      ),
+                      "dependencies": removed_dependencies,
+                      "failures": removed_inventory_failures,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          (output_dir / "added-dependency-type-index.json").write_text(
+              json.dumps(
+                  {
+                      "schemaVersion": 1,
+                      "purpose": "REPLACEMENT_CANDIDATE_POOL_ONLY",
+                      "selection": "ADDED Maven dependencies of type jar",
+                      "bytecodeInspection": False,
+                      "count": len(added_dependencies),
+                      "typeCount": sum(
+                          item["classCount"] for item in added_dependencies
+                      ),
+                      "dependencies": added_dependencies,
+                      "failures": added_inventory_failures,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+
+          with (output_dir / "added-dependency-types.jsonl").open(
+              "w", encoding="utf-8"
+          ) as handle:
+              for dependency in added_dependencies:
+                  for class_name in dependency["classNames"]:
+                      handle.write(
+                          json.dumps(
+                              {
+                                  "coordinate": dependency["coordinate"],
+                                  "newVersion": dependency["newVersion"],
+                                  "scopeCategory": dependency["scopeCategory"],
+                                  "className": class_name,
+                              },
+                              sort_keys=True,
+                          )
+                          + "\n"
+                      )
+
           (output_dir / "api-usage-source-manifest.json").write_text(
               json.dumps(
                   {
@@ -2513,6 +2970,10 @@ jobs:
               output.write(f"count={len(targets)}\n")
               output.write(f"source_count={len(source_files)}\n")
               output.write(f"classpath_count={len(classpath_paths)}\n")
+              output.write(
+                  "removed_type_target_count="
+                  f"{target_origin_counts.get('REMOVED_DEPENDENCY_TYPE', 0)}\n"
+              )
           PY
 
       - name: Verify and compile Java source-usage analyzer
@@ -2520,20 +2981,33 @@ jobs:
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/pr-change
+          BASE_BRANCH_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
 
-          analyzer_source="${GITHUB_WORKSPACE}/.github/scripts/JavaApiUsageAnalyzer.java"
-          analyzer_classes="${RUNNER_TEMP}/java-api-usage-analyzer/classes"
+          analyzer_root="${RUNNER_TEMP}/java-api-usage-analyzer"
+          analyzer_source="${analyzer_root}/JavaApiUsageAnalyzer.java"
+          analyzer_classes="${analyzer_root}/classes"
 
-          test -s "${analyzer_source}"
+          rm -rf -- "${analyzer_root}"
+          mkdir -p -- "${analyzer_classes}" "${OUTPUT_DIR}/analysis-tools"
+
+          if ! git show \
+            "${BASE_BRANCH_SHA}:.github/scripts/JavaApiUsageAnalyzer.java" \
+            > "${analyzer_source}"; then
+            echo "::error::Java API usage analyzer is missing in trusted base commit ${BASE_BRANCH_SHA}"
+            exit 1
+          fi
+
+          if [[ ! -s "${analyzer_source}" ]]; then
+            echo "::error::Java API usage analyzer from base commit is empty"
+            exit 1
+          fi
+
           printf '%s  %s\n' \
             "${JAVA_USAGE_ANALYZER_SHA256}" \
             "${analyzer_source}" \
             | sha256sum --check --strict -
-
-          rm -rf -- "${RUNNER_TEMP}/java-api-usage-analyzer"
-          mkdir -p -- "${analyzer_classes}" "${OUTPUT_DIR}/analysis-tools"
 
           javac \
             --release "${JAVA_VERSION}" \
@@ -2551,6 +3025,7 @@ jobs:
 
           OUTPUT_DIR="${OUTPUT_DIR}" \
           JAVA_USAGE_ANALYZER_SHA256="${JAVA_USAGE_ANALYZER_SHA256}" \
+          BASE_BRANCH_SHA="${BASE_BRANCH_SHA}" \
           python3 <<'PY'
           import json
           import os
@@ -2561,6 +3036,8 @@ jobs:
               "name": "JavaApiUsageAnalyzer",
               "engine": "JDK compiler Tree API with type attribution",
               "sourcePath": "analysis-tools/JavaApiUsageAnalyzer.java",
+              "sourceCommit": os.environ["BASE_BRANCH_SHA"],
+              "sourceTrust": "PULL_REQUEST_BASE",
               "sourceSha256": os.environ["JAVA_USAGE_ANALYZER_SHA256"],
               "javaRelease": os.environ["JAVA_VERSION"],
               "annotationProcessing": False,
@@ -2760,6 +3237,8 @@ jobs:
                   "targetId": target_id,
                   "coordinate": target["coordinate"],
                   "targetKind": target["kind"],
+                  "targetOrigin": target.get("targetOrigin", "JAPICMP_INCOMPATIBLE_API"),
+                  "dependencyChangeType": target.get("dependencyChangeType", "VERSION_CHANGED"),
                   "targetSignature": target["signature"],
                   "dependencyScopeCategory": target[
                       "dependencyScopeCategory"
@@ -2901,6 +3380,27 @@ jobs:
           dependency_scope_counts = Counter(
               item["dependencyScopeCategory"] for item in usages
           )
+          target_origin_usage_counts = Counter(
+              item["targetOrigin"] for item in usages
+          )
+          target_origin_target_counts = Counter(
+              item.get("targetOrigin", "JAPICMP_INCOMPATIBLE_API")
+              for item in targets
+          )
+          used_target_origin_counts = Counter(
+              item["target"].get("targetOrigin", "JAPICMP_INCOMPATIBLE_API")
+              for item in used_impacts
+          )
+          removed_dependency_usages = [
+              item
+              for item in usages
+              if item["targetOrigin"] == "REMOVED_DEPENDENCY_TYPE"
+          ]
+          japicmp_usages = [
+              item
+              for item in usages
+              if item["targetOrigin"] == "JAPICMP_INCOMPATIBLE_API"
+          ]
 
           incomplete_reasons = []
           if unresolved_impacts:
@@ -2946,6 +3446,23 @@ jobs:
               "matchKindCounts": dict(sorted(match_kind_counts.items())),
               "dependencyScopeUsageCounts": dict(
                   sorted(dependency_scope_counts.items())
+              ),
+              "targetOriginCounts": dict(
+                  sorted(target_origin_target_counts.items())
+              ),
+              "usedTargetOriginCounts": dict(
+                  sorted(used_target_origin_counts.items())
+              ),
+              "usageOriginCounts": dict(
+                  sorted(target_origin_usage_counts.items())
+              ),
+              "japicmpUsageCount": len(japicmp_usages),
+              "removedDependencyUsageCount": len(removed_dependency_usages),
+              "removedDependencyUsedTypeCount": len(
+                  {item["targetSignature"] for item in removed_dependency_usages}
+              ),
+              "removedDependencyAffectedSourceFileCount": len(
+                  {item["sourceFile"] for item in removed_dependency_usages}
               ),
               "sourceFileCount": metrics.get("sourceFileCount", 0),
               "classpathEntryCount": metrics.get("classpathEntryCount", 0),
@@ -3043,6 +3560,72 @@ jobs:
                       + "\n"
                   )
 
+          with (output_dir / "japicmp-api-usages.jsonl").open(
+              "w", encoding="utf-8"
+          ) as handle:
+              for usage in japicmp_usages:
+                  handle.write(
+                      json.dumps(usage, sort_keys=True, ensure_ascii=False)
+                      + "\n"
+                  )
+
+          with (output_dir / "removed-dependency-usages.jsonl").open(
+              "w", encoding="utf-8"
+          ) as handle:
+              for usage in removed_dependency_usages:
+                  handle.write(
+                      json.dumps(usage, sort_keys=True, ensure_ascii=False)
+                      + "\n"
+                  )
+
+          removed_dependency_impacts = [
+              item
+              for item in impacts
+              if item["target"].get("targetOrigin") == "REMOVED_DEPENDENCY_TYPE"
+              and item["impact"]["used"]
+          ]
+          (output_dir / "removed-dependency-impact.json").write_text(
+              json.dumps(
+                  {
+                      "schemaVersion": 1,
+                      "summary": {
+                          "usedTypeCount": len(removed_dependency_impacts),
+                          "usageCount": len(removed_dependency_usages),
+                          "affectedSourceFileCount": len(
+                              {
+                                  item["sourceFile"]
+                                  for item in removed_dependency_usages
+                              }
+                          ),
+                      },
+                      "impacts": removed_dependency_impacts,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+
+          (output_dir / "removed-dependency-usages.txt").write_text(
+              "\n".join(
+                  "\t".join(
+                      (
+                          item["coordinate"],
+                          item["targetSignature"],
+                          item["sourceSet"],
+                          item["sourceFile"],
+                          str(item["line"]),
+                          str(item["column"]),
+                          item["usageKind"],
+                      )
+                  )
+                  for item in removed_dependency_usages
+              )
+              + ("\n" if removed_dependency_usages else ""),
+              encoding="utf-8",
+          )
+
           with (output_dir / "api-usage-compiler-diagnostics.jsonl").open(
               "w", encoding="utf-8"
           ) as handle:
@@ -3110,8 +3693,12 @@ jobs:
               "## Java source impact of incompatible dependency APIs",
               "",
               f"- Analysis quality: **{quality}**",
-              f"- Incompatible API targets: **{len(targets)}**",
+              f"- Total source-impact targets: **{len(targets)}**",
+              f"- JApiCmp incompatible API targets: **{target_origin_target_counts.get('JAPICMP_INCOMPATIBLE_API', 0)}**",
+              f"- Removed-dependency type targets: **{target_origin_target_counts.get('REMOVED_DEPENDENCY_TYPE', 0)}**",
               f"- Targets used by project source: **{len(used_impacts)}**",
+              f"- JApiCmp API usages: **{len(japicmp_usages)}**",
+              f"- Removed-dependency type usages: **{len(removed_dependency_usages)}**",
               f"- Concrete source usages: **{len(usages)}**",
               f"- Affected source files: **{summary['affectedSourceFileCount']}**",
               f"- Main-source usages: **{source_set_counts.get('MAIN', 0)}**",
@@ -3136,7 +3723,7 @@ jobs:
                   (
                       "### Detected usages",
                       "",
-                      "| Dependency | Incompatible API | Source | Location | Usage | Confidence |",
+                      "| Dependency | Source-impact target | Source | Location | Usage | Confidence |",
                       "|---|---|---|---:|---|---|",
                   )
               )
@@ -3154,11 +3741,11 @@ jobs:
                   )
           elif targets:
               summary_lines.append(
-                  "No source usage of an incompatible dependency API was detected."
+                  "No source usage of a selected incompatible API or removed-dependency type was detected."
               )
           else:
               summary_lines.append(
-                  "JApiCmp reported no source- or binary-incompatible API targets."
+                  "No JApiCmp incompatibilities or removed-dependency type targets were selected."
               )
 
           summary_markdown = "\n".join(summary_lines).rstrip() + "\n"
