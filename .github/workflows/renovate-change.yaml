@@ -1,4 +1,4 @@
-name: PR 02 - Compare Maven dependencies
+name: PR 03 - Download changed Maven JARs
 
 on:
   pull_request:
@@ -11,16 +11,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr-dependency-compare-${{ github.event.pull_request.number }}
+  group: pr-dependency-jars-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 env:
   JAVA_VERSION: "17"
   MAVEN_DEPENDENCY_PLUGIN_VERSION: "3.11.0"
+  MAX_JAR_PAIRS: "200"
 
 jobs:
-  compare-maven-dependencies:
-    name: Compare resolved Maven dependencies
+  prepare-dependency-analysis:
+    name: Resolve dependencies and collect changed JARs
     runs-on: ubuntu-latest
 
     steps:
@@ -373,6 +374,591 @@ jobs:
                   summary.write("No resolved dependency version changes found.\n")
           PY
 
+      - name: Create changed JAR download plan
+        id: jar-plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUTPUT_DIR="${RUNNER_TEMP}/pr-change" \
+          MAX_JAR_PAIRS="${MAX_JAR_PAIRS}" \
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+          max_pairs = int(os.environ["MAX_JAR_PAIRS"])
+          changes = json.loads(
+              (output_dir / "dependency-changes.json").read_text(encoding="utf-8")
+          )
+          production_scopes = {"compile", "runtime", "provided", "system"}
+
+          def validate_segment(label, value, allow_empty=False):
+              value = "" if value is None else str(value)
+              if not value and not allow_empty:
+                  raise ValueError(f"{label} must not be empty")
+              if any(char in value for char in ("/", "\\", "\x00", "\n", "\r")):
+                  raise ValueError(f"Unsafe {label}: {value!r}")
+              if value in {".", ".."}:
+                  raise ValueError(f"Unsafe {label}: {value!r}")
+              return value
+
+          def repository_path(group_id, artifact_id, version, classifier):
+              group_parts = group_id.split(".")
+              if not group_parts or any(
+                  not part or part in {".", ".."} for part in group_parts
+              ):
+                  raise ValueError(f"Unsafe groupId: {group_id!r}")
+
+              filename = f"{artifact_id}-{version}"
+              if classifier:
+                  filename += f"-{classifier}"
+              filename += ".jar"
+
+              return str(
+                  PurePosixPath(*group_parts)
+                  / artifact_id
+                  / version
+                  / filename
+              )
+
+          def scope_category(old_scopes, new_scopes):
+              scopes = set(old_scopes) | set(new_scopes)
+              has_production = bool(scopes & production_scopes)
+              has_test = "test" in scopes
+
+              if has_production and has_test:
+                  return "MIXED"
+              if has_production:
+                  return "PRODUCTION"
+              if has_test:
+                  return "TEST_ONLY"
+              return "OTHER"
+
+          selected = []
+          skipped = []
+
+          for change in changes.get("changes", []):
+              if change.get("changeType") != "VERSION_CHANGED":
+                  continue
+
+              artifact_type = str(change.get("type") or "jar")
+              if artifact_type != "jar":
+                  skipped.append(
+                      {
+                          "reason": "NOT_A_JAR",
+                          "groupId": change.get("groupId"),
+                          "artifactId": change.get("artifactId"),
+                          "type": artifact_type,
+                          "classifier": change.get("classifier") or "",
+                      }
+                  )
+                  continue
+
+              group_id = validate_segment("groupId", change.get("groupId"))
+              artifact_id = validate_segment(
+                  "artifactId", change.get("artifactId")
+              )
+              classifier = validate_segment(
+                  "classifier",
+                  change.get("classifier") or "",
+                  allow_empty=True,
+              )
+
+              old_versions = [
+                  str(value) for value in change["old"].get("versions", [])
+              ]
+              new_versions = [
+                  str(value) for value in change["new"].get("versions", [])
+              ]
+
+              if len(old_versions) != 1 or len(new_versions) != 1:
+                  skipped.append(
+                      {
+                          "reason": "AMBIGUOUS_RESOLVED_VERSION",
+                          "groupId": group_id,
+                          "artifactId": artifact_id,
+                          "type": artifact_type,
+                          "classifier": classifier,
+                          "oldVersions": old_versions,
+                          "newVersions": new_versions,
+                      }
+                  )
+                  continue
+
+              old_version = validate_segment("oldVersion", old_versions[0])
+              new_version = validate_segment("newVersion", new_versions[0])
+              old_scopes = sorted(
+                  str(value) for value in change["old"].get("scopes", [])
+              )
+              new_scopes = sorted(
+                  str(value) for value in change["new"].get("scopes", [])
+              )
+              old_repository_path = repository_path(
+                  group_id, artifact_id, old_version, classifier
+              )
+              new_repository_path = repository_path(
+                  group_id, artifact_id, new_version, classifier
+              )
+
+              selected.append(
+                  {
+                      "groupId": group_id,
+                      "artifactId": artifact_id,
+                      "type": "jar",
+                      "classifier": classifier,
+                      "scopeCategory": scope_category(old_scopes, new_scopes),
+                      "old": {
+                          "version": old_version,
+                          "scopes": old_scopes,
+                          "direct": bool(change["old"].get("direct")),
+                          "repositoryPath": old_repository_path,
+                          "outputPath": f"jars/base/{old_repository_path}",
+                      },
+                      "new": {
+                          "version": new_version,
+                          "scopes": new_scopes,
+                          "direct": bool(change["new"].get("direct")),
+                          "repositoryPath": new_repository_path,
+                          "outputPath": f"jars/head/{new_repository_path}",
+                      },
+                  }
+              )
+
+          selected.sort(
+              key=lambda item: (
+                  item["groupId"],
+                  item["artifactId"],
+                  item["type"],
+                  item["classifier"],
+              )
+          )
+          skipped.sort(
+              key=lambda item: (
+                  item.get("groupId") or "",
+                  item.get("artifactId") or "",
+                  item.get("type") or "",
+                  item.get("classifier") or "",
+                  item["reason"],
+              )
+          )
+
+          if len(selected) > max_pairs:
+              raise ValueError(
+                  f"Refusing to download {len(selected)} changed JAR pairs; "
+                  f"MAX_JAR_PAIRS is {max_pairs}"
+              )
+
+          plan = {
+              "schemaVersion": 1,
+              "selection": {
+                  "changeType": "VERSION_CHANGED",
+                  "type": "jar",
+                  "requiresOneOldAndOneNewVersion": True,
+                  "maxPairs": max_pairs,
+              },
+              "summary": {
+                  "selectedPairs": len(selected),
+                  "skippedVersionChanges": len(skipped),
+                  "productionPairs": sum(
+                      item["scopeCategory"] == "PRODUCTION"
+                      for item in selected
+                  ),
+                  "testOnlyPairs": sum(
+                      item["scopeCategory"] == "TEST_ONLY"
+                      for item in selected
+                  ),
+                  "mixedPairs": sum(
+                      item["scopeCategory"] == "MIXED"
+                      for item in selected
+                  ),
+                  "otherScopePairs": sum(
+                      item["scopeCategory"] == "OTHER"
+                      for item in selected
+                  ),
+              },
+              "artifacts": selected,
+              "skipped": skipped,
+          }
+
+          (output_dir / "jar-download-plan.json").write_text(
+              json.dumps(plan, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              output.write(f"count={len(selected)}\n")
+          PY
+
+      - name: Resolve base and PR JAR files
+        if: steps.jar-plan.outputs.count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          resolved_root="${RUNNER_TEMP}/resolved-jars"
+          rm -rf -- "${resolved_root}"
+          mkdir -p -- "${resolved_root}/base" "${resolved_root}/head"
+
+          resolve_jars() {
+            local label="$1"
+            local project_dir="$2"
+            local destination="$3"
+            local -a mvn_command
+
+            if [[ -f "${project_dir}/mvnw" ]]; then
+              chmod +x "${project_dir}/mvnw"
+              mvn_command=("./mvnw")
+            else
+              mvn_command=("mvn")
+            fi
+
+            echo "::group::Resolve ${label} JAR files"
+
+            (
+              cd "${project_dir}"
+
+              "${mvn_command[@]}" \
+                -B \
+                -ntp \
+                -Dstyle.color=never \
+                -DskipTests \
+                "org.apache.maven.plugins:maven-dependency-plugin:${MAVEN_DEPENDENCY_PLUGIN_VERSION}:copy-dependencies" \
+                "-DoutputDirectory=${destination}" \
+                -DincludeTypes=jar \
+                -DincludeScope=test \
+                -Dmdep.useRepositoryLayout=true \
+                -Dmdep.useBaseVersion=true \
+                -Dmdep.stripVersion=false \
+                -Dmdep.stripClassifier=false
+            )
+
+            echo "::endgroup::"
+          }
+
+          resolve_jars \
+            "base" \
+            "${RUNNER_TEMP}/dependency-base" \
+            "${resolved_root}/base"
+
+          resolve_jars \
+            "head" \
+            "${RUNNER_TEMP}/dependency-head" \
+            "${resolved_root}/head"
+
+      - name: Select and verify changed JAR pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUTPUT_DIR="${RUNNER_TEMP}/pr-change" \
+          RESOLVED_ROOT="${RUNNER_TEMP}/resolved-jars" \
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          import shutil
+          import zipfile
+          from pathlib import Path
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+          resolved_root = Path(os.environ["RESOLVED_ROOT"])
+          plan = json.loads(
+              (output_dir / "jar-download-plan.json").read_text(encoding="utf-8")
+          )
+
+          native_suffixes = (
+              ".so",
+              ".dll",
+              ".dylib",
+              ".jnilib",
+              ".a",
+              ".lib",
+          )
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for block in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def copy_and_describe(source, destination_relative, version):
+              destination = output_dir / destination_relative
+              destination.parent.mkdir(parents=True, exist_ok=True)
+
+              if not source.is_file():
+                  raise FileNotFoundError(f"Resolved JAR not found: {source}")
+              if source.stat().st_size == 0:
+                  raise ValueError(f"Resolved JAR is empty: {source}")
+
+              shutil.copyfile(source, destination)
+
+              with zipfile.ZipFile(destination, "r") as jar:
+                  invalid_entry = jar.testzip()
+                  if invalid_entry is not None:
+                      raise ValueError(
+                          f"Invalid ZIP entry {invalid_entry!r} in {destination}"
+                      )
+
+                  names = sorted(
+                      entry.filename
+                      for entry in jar.infolist()
+                      if not entry.is_dir()
+                  )
+
+              native_entries = [
+                  name
+                  for name in names
+                  if name.lower().endswith(native_suffixes)
+              ]
+              class_count = sum(name.endswith(".class") for name in names)
+
+              if native_entries:
+                  analysis_kind = "NATIVE_OR_MIXED"
+              elif class_count:
+                  analysis_kind = "JAVA_BYTECODE"
+              else:
+                  analysis_kind = "RESOURCE_ONLY"
+
+              return {
+                  "version": version,
+                  "path": destination_relative,
+                  "sha256": sha256(destination),
+                  "sizeBytes": destination.stat().st_size,
+                  "snapshotVersion": "SNAPSHOT" in version.upper(),
+                  "entryCount": len(names),
+                  "classCount": class_count,
+                  "nativeLibraryCount": len(native_entries),
+                  "containsNativeLibraries": bool(native_entries),
+                  "nativeLibraryEntriesSample": native_entries[:20],
+                  "analysisKind": analysis_kind,
+                  "multiRelease": any(
+                      name.startswith("META-INF/versions/") for name in names
+                  ),
+                  "moduleInfoPresent": any(
+                      name == "module-info.class"
+                      or name.endswith("/module-info.class")
+                      for name in names
+                  ),
+              }
+
+          artifacts = []
+
+          for planned in plan.get("artifacts", []):
+              old_source = (
+                  resolved_root / "base" / planned["old"]["repositoryPath"]
+              )
+              new_source = (
+                  resolved_root / "head" / planned["new"]["repositoryPath"]
+              )
+
+              old = copy_and_describe(
+                  old_source,
+                  planned["old"]["outputPath"],
+                  planned["old"]["version"],
+              )
+              new = copy_and_describe(
+                  new_source,
+                  planned["new"]["outputPath"],
+                  planned["new"]["version"],
+              )
+
+              if (
+                  old["analysisKind"] == "NATIVE_OR_MIXED"
+                  or new["analysisKind"] == "NATIVE_OR_MIXED"
+              ):
+                  pair_analysis_kind = "NATIVE_OR_MIXED"
+              elif (
+                  old["analysisKind"] == "JAVA_BYTECODE"
+                  or new["analysisKind"] == "JAVA_BYTECODE"
+              ):
+                  pair_analysis_kind = "JAVA_BYTECODE"
+              else:
+                  pair_analysis_kind = "RESOURCE_ONLY"
+
+              artifacts.append(
+                  {
+                      "groupId": planned["groupId"],
+                      "artifactId": planned["artifactId"],
+                      "type": planned["type"],
+                      "classifier": planned["classifier"],
+                      "scopeCategory": planned["scopeCategory"],
+                      "oldScopes": planned["old"]["scopes"],
+                      "newScopes": planned["new"]["scopes"],
+                      "oldDirect": planned["old"]["direct"],
+                      "newDirect": planned["new"]["direct"],
+                      "analysisKind": pair_analysis_kind,
+                      "identicalBytes": old["sha256"] == new["sha256"],
+                      "old": old,
+                      "new": new,
+                  }
+              )
+
+          artifacts.sort(
+              key=lambda item: (
+                  item["groupId"],
+                  item["artifactId"],
+                  item["type"],
+                  item["classifier"],
+              )
+          )
+
+          total_bytes = sum(
+              artifact[side]["sizeBytes"]
+              for artifact in artifacts
+              for side in ("old", "new")
+          )
+          native_jar_files = sum(
+              artifact[side]["containsNativeLibraries"]
+              for artifact in artifacts
+              for side in ("old", "new")
+          )
+
+          manifest = {
+              "schemaVersion": 1,
+              "source": "dependency-changes.json",
+              "selection": plan["selection"],
+              "summary": {
+                  "pairCount": len(artifacts),
+                  "jarFileCount": len(artifacts) * 2,
+                  "totalBytes": total_bytes,
+                  "identicalPairCount": sum(
+                      artifact["identicalBytes"] for artifact in artifacts
+                  ),
+                  "nativeJarFileCount": native_jar_files,
+                  "nativeOrMixedPairCount": sum(
+                      artifact["analysisKind"] == "NATIVE_OR_MIXED"
+                      for artifact in artifacts
+                  ),
+                  "javaBytecodePairCount": sum(
+                      artifact["analysisKind"] == "JAVA_BYTECODE"
+                      for artifact in artifacts
+                  ),
+                  "resourceOnlyPairCount": sum(
+                      artifact["analysisKind"] == "RESOURCE_ONLY"
+                      for artifact in artifacts
+                  ),
+                  "productionPairCount": sum(
+                      artifact["scopeCategory"] == "PRODUCTION"
+                      for artifact in artifacts
+                  ),
+                  "testOnlyPairCount": sum(
+                      artifact["scopeCategory"] == "TEST_ONLY"
+                      for artifact in artifacts
+                  ),
+                  "mixedPairCount": sum(
+                      artifact["scopeCategory"] == "MIXED"
+                      for artifact in artifacts
+                  ),
+                  "otherScopePairCount": sum(
+                      artifact["scopeCategory"] == "OTHER"
+                      for artifact in artifacts
+                  ),
+                  "skippedVersionChanges": len(plan.get("skipped", [])),
+              },
+              "artifacts": artifacts,
+              "skipped": plan.get("skipped", []),
+          }
+
+          (output_dir / "jar-download-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          scope_files = {
+              "PRODUCTION": output_dir / "jar-pairs-production.txt",
+              "TEST_ONLY": output_dir / "jar-pairs-test-only.txt",
+              "MIXED": output_dir / "jar-pairs-mixed.txt",
+              "OTHER": output_dir / "jar-pairs-other-scope.txt",
+          }
+          scope_lines = {category: [] for category in scope_files}
+
+          for artifact in artifacts:
+              classifier = (
+                  f":{artifact['classifier']}" if artifact["classifier"] else ""
+              )
+              coordinate = (
+                  f"{artifact['groupId']}:{artifact['artifactId']}:"
+                  f"{artifact['type']}{classifier}"
+              )
+              scope_lines[artifact["scopeCategory"]].append(
+                  "\t".join(
+                      [
+                          coordinate,
+                          artifact["old"]["version"],
+                          artifact["new"]["version"],
+                          artifact["old"]["path"],
+                          artifact["new"]["path"],
+                      ]
+                  )
+              )
+
+          for category, path in scope_files.items():
+              lines = sorted(scope_lines[category])
+              path.write_text(
+                  "\n".join(lines) + ("\n" if lines else ""),
+                  encoding="utf-8",
+              )
+
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open(
+              "a", encoding="utf-8"
+          ) as summary:
+              values = manifest["summary"]
+              summary.write("\n## Changed Maven JAR files\n\n")
+              summary.write(f"- JAR pairs: **{values['pairCount']}**\n")
+              summary.write(f"- JAR files: **{values['jarFileCount']}**\n")
+              summary.write(
+                  f"- Total size: **{values['totalBytes'] / 1024 / 1024:.2f} MiB**\n"
+              )
+              summary.write(
+                  f"- Production pairs: **{values['productionPairCount']}**\n"
+              )
+              summary.write(
+                  f"- Test-only pairs: **{values['testOnlyPairCount']}**\n"
+              )
+              summary.write(
+                  f"- Native/mixed pairs: **{values['nativeOrMixedPairCount']}**\n"
+              )
+              summary.write(
+                  f"- Byte-identical version pairs: **{values['identicalPairCount']}**\n\n"
+              )
+
+              if artifacts:
+                  summary.write(
+                      "| Dependency | Old | New | Scope | Classes old to new | Content |\n"
+                  )
+                  summary.write("|---|---:|---:|---|---:|---|\n")
+
+                  for artifact in artifacts[:50]:
+                      classifier = (
+                          f":{artifact['classifier']}"
+                          if artifact["classifier"]
+                          else ""
+                      )
+                      coordinate = (
+                          f"{artifact['groupId']}:{artifact['artifactId']}:"
+                          f"{artifact['type']}{classifier}"
+                      )
+
+                      summary.write(
+                          f"| `{coordinate}` | `{artifact['old']['version']}` | "
+                          f"`{artifact['new']['version']}` | "
+                          f"{artifact['scopeCategory']} | "
+                          f"{artifact['old']['classCount']} to "
+                          f"{artifact['new']['classCount']} | "
+                          f"{artifact['analysisKind']} |\n"
+                      )
+              else:
+                  summary.write("No changed JAR pairs were selected.\n")
+          PY
+
+          rm -rf -- "${RUNNER_TEMP}/resolved-jars"
+
       - name: Create checksums
         shell: bash
         run: |
@@ -382,7 +968,6 @@ jobs:
             cd "${RUNNER_TEMP}/pr-change"
 
             find . \
-              -maxdepth 1 \
               -type f \
               ! -name SHA256SUMS \
               -printf '%P\0' \
@@ -391,10 +976,11 @@ jobs:
               > SHA256SUMS
           )
 
-      - name: Upload dependency comparison
+      - name: Upload dependency comparison and JAR pairs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: pr-dependency-change-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          name: pr-dependency-jars-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           path: ${{ runner.temp }}/pr-change
           if-no-files-found: error
           retention-days: 14
+          compression-level: 1
