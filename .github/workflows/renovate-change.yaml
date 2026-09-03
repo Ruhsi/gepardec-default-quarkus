@@ -1,4 +1,4 @@
-name: PR 03 - Download changed Maven JARs
+name: PR 04 - Analyze changed Maven APIs
 
 on:
   pull_request:
@@ -11,17 +11,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr-dependency-jars-${{ github.event.pull_request.number }}
+  group: pr-dependency-api-diff-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 env:
   JAVA_VERSION: "17"
   MAVEN_DEPENDENCY_PLUGIN_VERSION: "3.11.0"
   MAX_JAR_PAIRS: "200"
+  MAX_API_DIFF_PAIRS: "200"
+  JAPICMP_VERSION: "0.26.1"
+  JAPICMP_SHA256: "419ebc0d8ac5cc1e11c9961ada2eeb7136dc054de6a43cafff3207504d85da23"
+  JAPICMP_PAIR_TIMEOUT_SECONDS: "180"
 
 jobs:
   prepare-dependency-analysis:
-    name: Resolve dependencies and collect changed JARs
+    name: Resolve dependencies, collect JARs and analyze APIs
     runs-on: ubuntu-latest
 
     steps:
@@ -957,9 +961,1210 @@ jobs:
                   summary.write("No changed JAR pairs were selected.\n")
           PY
 
-          rm -rf -- "${RUNNER_TEMP}/resolved-jars"
+      - name: Create Java API diff plan
+        id: api-plan
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/pr-change
+        run: |
+          set -euo pipefail
+
+          OUTPUT_DIR="${OUTPUT_DIR}" \
+          MAX_API_DIFF_PAIRS="${MAX_API_DIFF_PAIRS}" \
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import quote
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+          max_pairs = int(os.environ["MAX_API_DIFF_PAIRS"])
+          manifest = json.loads(
+              (output_dir / "jar-download-manifest.json").read_text(encoding="utf-8")
+          )
+
+
+          def encode_segment(value):
+              value = str(value)
+              if not value or value in {".", ".."}:
+                  raise ValueError(f"Unsafe empty/path segment: {value!r}")
+              return quote(value, safe="._-+")
+
+
+          def coordinate_of(artifact):
+              classifier = f":{artifact['classifier']}" if artifact["classifier"] else ""
+              return (
+                  f"{artifact['groupId']}:{artifact['artifactId']}:"
+                  f"{artifact['type']}{classifier}"
+              )
+
+          selected = []
+          skipped = []
+
+          for artifact in manifest.get("artifacts", []):
+              coordinate = coordinate_of(artifact)
+              reason = None
+
+              if artifact.get("identicalBytes"):
+                  reason = "BYTE_IDENTICAL"
+              elif artifact.get("analysisKind") != "JAVA_BYTECODE":
+                  reason = artifact.get("analysisKind") or "UNKNOWN_ANALYSIS_KIND"
+
+              if reason is not None:
+                  skipped.append(
+                      {
+                          "coordinate": coordinate,
+                          "groupId": artifact["groupId"],
+                          "artifactId": artifact["artifactId"],
+                          "type": artifact["type"],
+                          "classifier": artifact["classifier"],
+                          "scopeCategory": artifact["scopeCategory"],
+                          "analysisKind": artifact.get("analysisKind"),
+                          "reason": reason,
+                          "oldVersion": artifact["old"]["version"],
+                          "newVersion": artifact["new"]["version"],
+                      }
+                  )
+                  continue
+
+              group_path = "/".join(
+                  encode_segment(part) for part in artifact["groupId"].split(".")
+              )
+              artifact_segment = encode_segment(artifact["artifactId"])
+              classifier_segment = (
+                  encode_segment(artifact["classifier"])
+                  if artifact["classifier"]
+                  else "_main"
+              )
+              version_segment = (
+                  f"{encode_segment(artifact['old']['version'])}_to_"
+                  f"{encode_segment(artifact['new']['version'])}"
+              )
+
+              selected.append(
+                  {
+                      "groupId": artifact["groupId"],
+                      "artifactId": artifact["artifactId"],
+                      "type": artifact["type"],
+                      "classifier": artifact["classifier"],
+                      "coordinate": coordinate,
+                      "scopeCategory": artifact["scopeCategory"],
+                      "analysisKind": artifact["analysisKind"],
+                      "old": artifact["old"],
+                      "new": artifact["new"],
+                      "reportDirectory": (
+                          "api-diff/reports/"
+                          f"{group_path}/{artifact_segment}/{classifier_segment}/"
+                          f"{version_segment}"
+                      ),
+                  }
+              )
+
+          selected.sort(
+              key=lambda item: (
+                  item["groupId"],
+                  item["artifactId"],
+                  item["type"],
+                  item["classifier"],
+              )
+          )
+          skipped.sort(
+              key=lambda item: (
+                  item["groupId"],
+                  item["artifactId"],
+                  item["type"],
+                  item["classifier"],
+                  item["reason"],
+              )
+          )
+
+          if len(selected) > max_pairs:
+              raise ValueError(
+                  f"Refusing to analyze {len(selected)} Java JAR pairs; "
+                  f"MAX_API_DIFF_PAIRS is {max_pairs}"
+              )
+
+          plan = {
+              "schemaVersion": 1,
+              "source": "jar-download-manifest.json",
+              "selection": {
+                  "analysisKind": "JAVA_BYTECODE",
+                  "excludeByteIdenticalPairs": True,
+                  "accessModifier": "PROTECTED",
+                  "onlyModified": True,
+                  "annotations": True,
+                  "syntheticMembers": False,
+                  "markdownReport": True,
+                  "maxPairs": max_pairs,
+              },
+              "summary": {
+                  "selectedPairs": len(selected),
+                  "skippedPairs": len(skipped),
+                  "productionPairs": sum(
+                      item["scopeCategory"] == "PRODUCTION" for item in selected
+                  ),
+                  "testOnlyPairs": sum(
+                      item["scopeCategory"] == "TEST_ONLY" for item in selected
+                  ),
+                  "mixedPairs": sum(
+                      item["scopeCategory"] == "MIXED" for item in selected
+                  ),
+                  "otherScopePairs": sum(
+                      item["scopeCategory"] == "OTHER" for item in selected
+                  ),
+              },
+              "artifacts": selected,
+              "skipped": skipped,
+          }
+
+          (output_dir / "api-diff-plan.json").write_text(
+              json.dumps(plan, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"count={len(selected)}\n")
+          PY
+
+      - name: Download and verify JApiCmp
+        if: steps.api-plan.outputs.count != '0'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/pr-change
+        run: |
+          set -euo pipefail
+
+          tool_dir="${RUNNER_TEMP}/japicmp-tool"
+          tool_jar="${tool_dir}/japicmp-${JAPICMP_VERSION}-jar-with-dependencies.jar"
+          tool_url="https://github.com/siom79/japicmp/releases/download/japicmp-base-${JAPICMP_VERSION}/japicmp-${JAPICMP_VERSION}-jar-with-dependencies.jar"
+
+          rm -rf -- "${tool_dir}"
+          mkdir -p -- "${tool_dir}"
+
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --output "${tool_jar}" \
+            "${tool_url}"
+
+          printf '%s  %s\n' \
+            "${JAPICMP_SHA256}" \
+            "${tool_jar}" \
+            | sha256sum --check --strict -
+
+          java -jar "${tool_jar}" --help > /dev/null
+
+          OUTPUT_DIR="${OUTPUT_DIR}" \
+          JAPICMP_VERSION="${JAPICMP_VERSION}" \
+          JAPICMP_SHA256="${JAPICMP_SHA256}" \
+          JAPICMP_SOURCE_URL="${tool_url}" \
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+          metadata = {
+              "artifact": (
+                  "com.github.siom79.japicmp:japicmp:"
+                  f"{os.environ['JAPICMP_VERSION']}:jar:jar-with-dependencies"
+              ),
+              "downloaded": True,
+              "sha256": os.environ["JAPICMP_SHA256"],
+              "sourceUrl": os.environ["JAPICMP_SOURCE_URL"],
+              "version": os.environ["JAPICMP_VERSION"],
+          }
+          (output_dir / "japicmp-tool.json").write_text(
+              json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Run deterministic JApiCmp analysis
+        if: steps.api-plan.outputs.count != '0'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/pr-change
+          RESOLVED_ROOT: ${{ runner.temp }}/resolved-jars
+          JAPICMP_TOOL: ${{ runner.temp }}/japicmp-tool/japicmp-${{ env.JAPICMP_VERSION }}-jar-with-dependencies.jar
+          JAPICMP_PAIR_TIMEOUT_SECONDS: ${{ env.JAPICMP_PAIR_TIMEOUT_SECONDS }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import collections
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          OUTPUT_DIR = Path(os.environ["OUTPUT_DIR"])
+          RESOLVED_ROOT = Path(os.environ["RESOLVED_ROOT"])
+          JAPICMP_TOOL = Path(os.environ["JAPICMP_TOOL"])
+          JAPICMP_VERSION = os.environ["JAPICMP_VERSION"]
+          JAPICMP_SHA256 = os.environ["JAPICMP_SHA256"]
+          PAIR_TIMEOUT_SECONDS = int(
+              os.environ.get("JAPICMP_PAIR_TIMEOUT_SECONDS", "180")
+          )
+          RUNNER_TEMP = Path(os.environ.get("RUNNER_TEMP", RESOLVED_ROOT.parent))
+
+          plan = json.loads(
+              (OUTPUT_DIR / "api-diff-plan.json").read_text(encoding="utf-8")
+          )
+
+
+          def bool_attr(value, default=True):
+              if value is None:
+                  return default
+              return str(value).strip().lower() == "true"
+
+
+          def clean_text(value):
+              return (value or "").strip()
+
+
+          def compatibility_changes(element, recursive=False):
+              path = ".//compatibilityChange" if recursive else "./compatibilityChanges/compatibilityChange"
+              changes = []
+              for item in element.findall(path):
+                  change_type = item.attrib.get("type") or clean_text(item.text)
+                  if not change_type:
+                      continue
+                  changes.append(
+                      {
+                          "type": change_type,
+                          "binaryCompatible": bool_attr(
+                              item.attrib.get("binaryCompatible"), default=True
+                          ),
+                          "sourceCompatible": bool_attr(
+                              item.attrib.get("sourceCompatible"), default=True
+                          ),
+                      }
+                  )
+              changes.sort(
+                  key=lambda item: (
+                      item["type"],
+                      item["binaryCompatible"],
+                      item["sourceCompatible"],
+                  )
+              )
+              return changes
+
+
+          def changed_children(element, path):
+              values = []
+              for item in element.findall(path):
+                  status = item.attrib.get("changeStatus")
+                  direct_changes = compatibility_changes(item)
+                  if status in (None, "UNCHANGED") and not direct_changes:
+                      continue
+                  values.append(
+                      {
+                          "tag": item.tag.split("}")[-1],
+                          "attributes": dict(sorted(item.attrib.items())),
+                          "value": clean_text(item.text) or None,
+                          "compatibilityChanges": direct_changes,
+                      }
+                  )
+              return values
+
+
+          def element_has_change(element):
+              if element.attrib.get("changeStatus") not in (None, "UNCHANGED"):
+                  return True
+              if not bool_attr(element.attrib.get("binaryCompatible"), default=True):
+                  return True
+              if not bool_attr(element.attrib.get("sourceCompatible"), default=True):
+                  return True
+              if compatibility_changes(element):
+                  return True
+              for child in element.iter():
+                  if child is element:
+                      continue
+                  if child.attrib.get("changeStatus") not in (None, "UNCHANGED"):
+                      return True
+                  if child.tag.split("}")[-1] == "compatibilityChange":
+                      return True
+              return False
+
+
+          def parameter_types(element):
+              return [
+                  item.attrib.get("type", "n.a.")
+                  for item in element.findall("./parameters/parameter")
+              ]
+
+
+          def describe_member(kind, class_name, element):
+              name = element.attrib.get("name") or "n.a."
+              parameters = parameter_types(element)
+
+              if kind == "METHOD":
+                  signature = f"{class_name}#{name}({','.join(parameters)})"
+              elif kind == "CONSTRUCTOR":
+                  signature = f"{class_name}#<init>({','.join(parameters)})"
+              elif kind == "FIELD":
+                  signature = f"{class_name}#{name}"
+              else:
+                  raise ValueError(f"Unsupported member kind: {kind}")
+
+              details = {
+                  "modifiers": changed_children(element, "./modifiers/modifier"),
+                  "annotations": changed_children(element, "./annotations/annotation"),
+                  "exceptions": changed_children(element, "./exceptions/exception"),
+                  "genericTemplates": changed_children(
+                      element, "./genericTemplates/genericTemplate"
+                  ),
+              }
+
+              type_element = element.find("./type")
+              if type_element is not None:
+                  details["type"] = dict(sorted(type_element.attrib.items()))
+
+              return_type = element.find("./returnType")
+              if return_type is not None:
+                  details["returnType"] = dict(sorted(return_type.attrib.items()))
+
+              direct_changes = compatibility_changes(element)
+              return {
+                  "kind": kind,
+                  "className": class_name,
+                  "name": name,
+                  "parameters": parameters,
+                  "signature": signature,
+                  "changeStatus": element.attrib.get("changeStatus", "UNCHANGED"),
+                  "binaryCompatible": bool_attr(
+                      element.attrib.get("binaryCompatible"), default=True
+                  ),
+                  "sourceCompatible": bool_attr(
+                      element.attrib.get("sourceCompatible"), default=True
+                  ),
+                  "compatibilityChanges": direct_changes,
+                  "details": details,
+              }
+
+
+          def describe_class_level(class_element):
+              class_name = class_element.attrib.get("fullyQualifiedName", "n.a.")
+              direct_changes = compatibility_changes(class_element)
+
+              class_level_details = {
+                  "modifiers": changed_children(
+                      class_element, "./modifiers/modifier"
+                  ),
+                  "superclass": changed_children(class_element, "./superclass"),
+                  "interfaces": changed_children(
+                      class_element, "./interfaces/interface"
+                  ),
+                  "annotations": changed_children(
+                      class_element, "./annotations/annotation"
+                  ),
+                  "classType": changed_children(class_element, "./classType"),
+                  "classFileFormatVersion": changed_children(
+                      class_element, "./classFileFormatVersion"
+                  ),
+                  "genericTemplates": changed_children(
+                      class_element, "./genericTemplates/genericTemplate"
+                  ),
+              }
+
+              has_direct_change = (
+                  class_element.attrib.get("changeStatus") in {"NEW", "REMOVED"}
+                  or bool(direct_changes)
+                  or any(class_level_details.values())
+              )
+              if not has_direct_change:
+                  return None
+
+              return {
+                  "kind": "CLASS",
+                  "className": class_name,
+                  "name": class_name,
+                  "parameters": [],
+                  "signature": class_name,
+                  "changeStatus": class_element.attrib.get(
+                      "changeStatus", "UNCHANGED"
+                  ),
+                  "binaryCompatible": bool_attr(
+                      class_element.attrib.get("binaryCompatible"), default=True
+                  ),
+                  "sourceCompatible": bool_attr(
+                      class_element.attrib.get("sourceCompatible"), default=True
+                  ),
+                  "compatibilityChanges": direct_changes,
+                  "details": class_level_details,
+              }
+
+
+          def sanitize_log(text):
+              text = text.replace(str(OUTPUT_DIR), "<OUTPUT_DIR>")
+              text = text.replace(str(RESOLVED_ROOT), "<RESOLVED_ROOT>")
+              text = text.replace(str(RUNNER_TEMP), "<RUNNER_TEMP>")
+              text = text.replace(str(JAPICMP_TOOL), "<JAPICMP_TOOL>")
+              text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+              interesting = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if any(
+                      token in stripped
+                      for token in (
+                          "Could not load",
+                          "Class not found",
+                          "Please make sure",
+                          "Exception",
+                          "ERROR",
+                          "Error",
+                          "E:",
+                      )
+                  ):
+                      stripped = re.sub(
+                          r"\b\d{4}-\d{2}-\d{2}[T ][0-9:.+Z-]+\b",
+                          "<TIMESTAMP>",
+                          stripped,
+                      )
+                      interesting.append(stripped)
+
+              if not interesting:
+                  interesting = [line.strip() for line in text.splitlines() if line.strip()]
+
+              unique = []
+              seen = set()
+              for line in interesting:
+                  if line not in seen:
+                      seen.add(line)
+                      unique.append(line)
+                  if len(unique) == 30:
+                      break
+              return unique
+
+
+          def remove_whitespace_nodes(element):
+              if element.text is not None:
+                  element.text = element.text.strip() or None
+              if element.tail is not None:
+                  element.tail = element.tail.strip() or None
+              for child in element:
+                  remove_whitespace_nodes(child)
+
+
+          def normalize_xml(raw_path, destination, artifact, coordinate):
+              tree = ET.parse(raw_path)
+              root = tree.getroot()
+              root.attrib.pop("creationTimestamp", None)
+              root.set("oldJar", artifact["old"]["path"])
+              root.set("newJar", artifact["new"]["path"])
+              root.set("title", coordinate)
+
+              for key in list(root.attrib):
+                  if "classpath" in key.lower():
+                      root.set(key, "<RESOLVED_DEPENDENCY_CLASSPATH>")
+
+              remove_whitespace_nodes(root)
+              for element in root.iter():
+                  element.attrib = dict(sorted(element.attrib.items()))
+
+              xml_text = ET.tostring(root, encoding="unicode")
+              canonical = ET.canonicalize(
+                  xml_data=xml_text,
+                  with_comments=False,
+                  strip_text=False,
+              )
+              destination.write_text(
+                  '<?xml version="1.0" encoding="UTF-8"?>\n'
+                  + canonical
+                  + "\n",
+                  encoding="utf-8",
+              )
+              raw_path.unlink()
+
+              for schema_file in destination.parent.glob("*.xsd"):
+                  schema_file.unlink()
+
+              return root
+
+
+          def normalize_markdown(text, destination, artifact, coordinate):
+              replacements = (
+                  (str(OUTPUT_DIR / artifact["old"]["path"]), artifact["old"]["path"]),
+                  (str(OUTPUT_DIR / artifact["new"]["path"]), artifact["new"]["path"]),
+                  (str(OUTPUT_DIR), "<OUTPUT_DIR>"),
+                  (str(RESOLVED_ROOT), "<RESOLVED_ROOT>"),
+                  (str(RUNNER_TEMP), "<RUNNER_TEMP>"),
+                  (str(JAPICMP_TOOL), "<JAPICMP_TOOL>"),
+              )
+              normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+              for old, new in replacements:
+                  normalized = normalized.replace(old, new)
+
+              lines = [line.rstrip() for line in normalized.splitlines()]
+              while lines and not lines[0]:
+                  lines.pop(0)
+              while lines and not lines[-1]:
+                  lines.pop()
+
+              if not lines:
+                  lines = [f"# JApiCmp report: {coordinate}", "", "No API changes."]
+
+              destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+          def is_missing_class_failure(text):
+              lowered = text.lower()
+              direct_markers = (
+                  "could not load",
+                  "class not found",
+                  "classnotfoundexception",
+                  "noclassdeffounderror",
+              )
+              if any(marker in lowered for marker in direct_markers):
+                  return True
+              return (
+                  "please make sure that all libraries have been added"
+                  in lowered
+                  and "--ignore-missing-classes" in lowered
+              )
+
+
+          def write_failure(artifact, coordinate, stage, return_code, output):
+              diagnostics = sanitize_log(output)
+              failure = {
+                  "schemaVersion": 1,
+                  "coordinate": coordinate,
+                  "groupId": artifact["groupId"],
+                  "artifactId": artifact["artifactId"],
+                  "type": artifact["type"],
+                  "classifier": artifact["classifier"],
+                  "oldVersion": artifact["old"]["version"],
+                  "newVersion": artifact["new"]["version"],
+                  "stage": stage,
+                  "returnCode": return_code,
+                  "diagnostics": diagnostics,
+              }
+              (OUTPUT_DIR / "api-diff-failure.json").write_text(
+                  json.dumps(failure, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              return diagnostics
+
+
+          def summarize_report(
+              root,
+              artifact,
+              coordinate,
+              report_path,
+              markdown_report_path,
+              mode,
+              diagnostics,
+          ):
+              class_elements = root.findall("./classes/class")
+              symbols = []
+
+              class_counts = collections.Counter()
+              member_counts = collections.Counter()
+
+              for class_element in class_elements:
+                  class_status = class_element.attrib.get("changeStatus", "UNCHANGED")
+                  class_counts[class_status] += 1
+                  class_name = class_element.attrib.get("fullyQualifiedName", "n.a.")
+
+                  class_symbol = describe_class_level(class_element)
+                  if class_symbol is not None:
+                      symbols.append(class_symbol)
+
+                  for kind, path in (
+                      ("METHOD", "./methods/method"),
+                      ("CONSTRUCTOR", "./constructors/constructor"),
+                      ("FIELD", "./fields/field"),
+                  ):
+                      for element in class_element.findall(path):
+                          if not element_has_change(element):
+                              continue
+                          symbols.append(describe_member(kind, class_name, element))
+                          member_counts[kind] += 1
+
+              symbols.sort(
+                  key=lambda item: (
+                      item["className"],
+                      item["kind"],
+                      item["signature"],
+                      item["changeStatus"],
+                  )
+              )
+
+              all_changes = compatibility_changes(root, recursive=True)
+              change_counts = collections.Counter(
+                  item["type"] for item in all_changes
+              )
+
+              binary_compatible = all(
+                  bool_attr(item.attrib.get("binaryCompatible"), default=True)
+                  for item in class_elements
+              )
+              source_compatible = all(
+                  bool_attr(item.attrib.get("sourceCompatible"), default=True)
+                  for item in class_elements
+              )
+
+              incompatible_symbols = [
+                  item
+                  for item in symbols
+                  if not item["binaryCompatible"] or not item["sourceCompatible"]
+              ]
+
+              return {
+                  "groupId": artifact["groupId"],
+                  "artifactId": artifact["artifactId"],
+                  "type": artifact["type"],
+                  "classifier": artifact["classifier"],
+                  "coordinate": coordinate,
+                  "scopeCategory": artifact["scopeCategory"],
+                  "oldVersion": artifact["old"]["version"],
+                  "newVersion": artifact["new"]["version"],
+                  "analysisMode": mode,
+                  "diagnostics": diagnostics,
+                  "reportPath": report_path,
+                  "markdownReportPath": markdown_report_path,
+                  "apiChanged": bool(class_elements),
+                  "binaryCompatible": binary_compatible,
+                  "sourceCompatible": source_compatible,
+                  "counts": {
+                      "changedClasses": len(class_elements),
+                      "newClasses": class_counts["NEW"],
+                      "removedClasses": class_counts["REMOVED"],
+                      "modifiedClasses": class_counts["MODIFIED"],
+                      "changedMethods": member_counts["METHOD"],
+                      "changedConstructors": member_counts["CONSTRUCTOR"],
+                      "changedFields": member_counts["FIELD"],
+                      "changedSymbols": len(symbols),
+                      "incompatibleSymbols": len(incompatible_symbols),
+                      "compatibilityChangeOccurrences": len(all_changes),
+                  },
+                  "compatibilityChanges": dict(sorted(change_counts.items())),
+                  "changedSymbols": symbols,
+              }
+
+
+          def coordinate_of(artifact):
+              classifier = f":{artifact['classifier']}" if artifact["classifier"] else ""
+              return (
+                  f"{artifact['groupId']}:{artifact['artifactId']}:"
+                  f"{artifact['type']}{classifier}"
+              )
+
+
+          def build_classpath(side, excluded_relative):
+              root = RESOLVED_ROOT / side
+              excluded = (root / excluded_relative).resolve()
+              jars = [
+                  path.resolve()
+                  for path in root.rglob("*.jar")
+                  if path.is_file() and path.resolve() != excluded
+              ]
+              jars.sort(key=lambda path: str(path))
+              return os.pathsep.join(str(path) for path in jars)
+
+
+          def run_tool(artifact, report_dir, ignore_missing):
+              old_jar = OUTPUT_DIR / artifact["old"]["path"]
+              new_jar = OUTPUT_DIR / artifact["new"]["path"]
+              old_relative = artifact["old"]["path"].removeprefix("jars/base/")
+              new_relative = artifact["new"]["path"].removeprefix("jars/head/")
+              old_classpath = build_classpath("base", old_relative)
+              new_classpath = build_classpath("head", new_relative)
+              raw_xml = report_dir / "japicmp.raw.xml"
+
+              command = [
+                  "java",
+                  "-Xmx1024m",
+                  "-jar",
+                  str(JAPICMP_TOOL),
+                  "-a",
+                  "protected",
+                  "-m",
+                  "--markdown",
+                  "--report-only-filename",
+                  "--old",
+                  str(old_jar),
+                  "--new",
+                  str(new_jar),
+                  "--xml-file",
+                  str(raw_xml),
+              ]
+              if old_classpath or new_classpath:
+                  command.extend(
+                      [
+                          "--old-classpath",
+                          old_classpath,
+                          "--new-classpath",
+                          new_classpath,
+                      ]
+                  )
+              if ignore_missing:
+                  command.append("--ignore-missing-classes")
+
+              try:
+                  process = subprocess.run(
+                      command,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      encoding="utf-8",
+                      errors="replace",
+                      check=False,
+                      timeout=PAIR_TIMEOUT_SECONDS,
+                  )
+                  return process.returncode, process.stdout, raw_xml
+              except subprocess.TimeoutExpired as exc:
+                  output = exc.stdout or ""
+                  if isinstance(output, bytes):
+                      output = output.decode("utf-8", errors="replace")
+                  timeout_message = (
+                      f"JApiCmp timed out after {PAIR_TIMEOUT_SECONDS} seconds."
+                  )
+                  return 124, timeout_message + "\n" + output, raw_xml
+
+
+          if not JAPICMP_TOOL.is_file():
+              raise FileNotFoundError(f"JApiCmp tool not found: {JAPICMP_TOOL}")
+
+          report_summaries = []
+          flat_changes = []
+          incompatible_changes = []
+
+          for artifact in plan.get("artifacts", []):
+              coordinate = coordinate_of(artifact)
+              report_dir = OUTPUT_DIR / artifact["reportDirectory"]
+              report_dir.mkdir(parents=True, exist_ok=True)
+
+              strict_code, strict_output, raw_xml = run_tool(
+                  artifact, report_dir, ignore_missing=False
+              )
+              diagnostics = []
+
+              if strict_code == 0 and raw_xml.is_file():
+                  mode = "STRICT"
+                  report_output = strict_output
+              else:
+                  if raw_xml.exists():
+                      raw_xml.unlink()
+
+                  if not is_missing_class_failure(strict_output):
+                      diagnostics = write_failure(
+                          artifact,
+                          coordinate,
+                          "STRICT",
+                          strict_code,
+                          strict_output,
+                      )
+                      print(f"JApiCmp failed for {coordinate}", file=sys.stderr)
+                      print("\n".join(diagnostics), file=sys.stderr)
+                      raise RuntimeError(
+                          f"JApiCmp failed for {coordinate}; "
+                          "the error was not a missing-class failure"
+                      )
+
+                  diagnostics = sanitize_log(strict_output)
+                  fallback_code, fallback_output, raw_xml = run_tool(
+                      artifact, report_dir, ignore_missing=True
+                  )
+                  if fallback_code != 0 or not raw_xml.is_file():
+                      fallback_diagnostics = write_failure(
+                          artifact,
+                          coordinate,
+                          "IGNORE_MISSING_CLASSES_FALLBACK",
+                          fallback_code,
+                          fallback_output,
+                      )
+                      print(f"JApiCmp failed for {coordinate}", file=sys.stderr)
+                      print("\n".join(fallback_diagnostics), file=sys.stderr)
+                      raise RuntimeError(
+                          f"JApiCmp failed in strict and fallback mode for {coordinate}"
+                      )
+                  mode = "IGNORE_MISSING_CLASSES_FALLBACK"
+                  report_output = fallback_output
+
+              report_relative = f"{artifact['reportDirectory']}/japicmp.xml"
+              markdown_report_relative = (
+                  f"{artifact['reportDirectory']}/japicmp.md"
+              )
+              normalized_report = OUTPUT_DIR / report_relative
+              normalized_markdown_report = OUTPUT_DIR / markdown_report_relative
+              root = normalize_xml(
+                  raw_xml,
+                  normalized_report,
+                  artifact,
+                  coordinate,
+              )
+              normalize_markdown(
+                  report_output,
+                  normalized_markdown_report,
+                  artifact,
+                  coordinate,
+              )
+              summary = summarize_report(
+                  root,
+                  artifact,
+                  coordinate,
+                  report_relative,
+                  markdown_report_relative,
+                  mode,
+                  diagnostics,
+              )
+              report_summaries.append(summary)
+
+              per_report_summary = dict(summary)
+              (report_dir / "report-summary.json").write_text(
+                  json.dumps(per_report_summary, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+              for symbol in summary["changedSymbols"]:
+                  record = {
+                      "coordinate": coordinate,
+                      "groupId": artifact["groupId"],
+                      "artifactId": artifact["artifactId"],
+                      "classifier": artifact["classifier"],
+                      "scopeCategory": artifact["scopeCategory"],
+                      "oldVersion": artifact["old"]["version"],
+                      "newVersion": artifact["new"]["version"],
+                      "analysisMode": mode,
+                      "reportPath": report_relative,
+                      "markdownReportPath": markdown_report_relative,
+                      **symbol,
+                  }
+                  flat_changes.append(record)
+                  if not symbol["binaryCompatible"] or not symbol["sourceCompatible"]:
+                      incompatible_changes.append(record)
+
+          report_summaries.sort(
+              key=lambda item: (
+                  item["groupId"],
+                  item["artifactId"],
+                  item["type"],
+                  item["classifier"],
+              )
+          )
+          flat_changes.sort(
+              key=lambda item: (
+                  item["coordinate"],
+                  item["className"],
+                  item["kind"],
+                  item["signature"],
+              )
+          )
+          incompatible_changes.sort(
+              key=lambda item: (
+                  item["coordinate"],
+                  item["className"],
+                  item["kind"],
+                  item["signature"],
+              )
+          )
+
+          aggregate_change_counts = collections.Counter()
+          for report in report_summaries:
+              aggregate_change_counts.update(report["compatibilityChanges"])
+
+          summary_values = {
+              "plannedPairCount": len(plan.get("artifacts", [])),
+              "analyzedPairCount": len(report_summaries),
+              "strictPairCount": sum(
+                  item["analysisMode"] == "STRICT" for item in report_summaries
+              ),
+              "fallbackPairCount": sum(
+                  item["analysisMode"] == "IGNORE_MISSING_CLASSES_FALLBACK"
+                  for item in report_summaries
+              ),
+              "apiChangedPairCount": sum(
+                  item["apiChanged"] for item in report_summaries
+              ),
+              "noApiChangePairCount": sum(
+                  not item["apiChanged"] for item in report_summaries
+              ),
+              "binaryIncompatiblePairCount": sum(
+                  not item["binaryCompatible"] for item in report_summaries
+              ),
+              "sourceIncompatiblePairCount": sum(
+                  not item["sourceCompatible"] for item in report_summaries
+              ),
+              "changedClassCount": sum(
+                  item["counts"]["changedClasses"] for item in report_summaries
+              ),
+              "changedMethodCount": sum(
+                  item["counts"]["changedMethods"] for item in report_summaries
+              ),
+              "changedConstructorCount": sum(
+                  item["counts"]["changedConstructors"] for item in report_summaries
+              ),
+              "changedFieldCount": sum(
+                  item["counts"]["changedFields"] for item in report_summaries
+              ),
+              "changedSymbolCount": len(flat_changes),
+              "incompatibleSymbolCount": len(incompatible_changes),
+              "skippedPairCount": len(plan.get("skipped", [])),
+          }
+
+          result = {
+              "schemaVersion": 1,
+              "tool": {
+                  "name": "japicmp",
+                  "version": JAPICMP_VERSION,
+                  "sha256": JAPICMP_SHA256,
+                  "accessModifier": "PROTECTED",
+                  "onlyModified": True,
+                  "annotations": True,
+                  "syntheticMembers": False,
+                  "markdownReport": True,
+                  "strictClasspathFirst": True,
+                  "fallbackOnlyForMissingClasses": True,
+                  "pairTimeoutSeconds": PAIR_TIMEOUT_SECONDS,
+                  "missingClassFallback": "--ignore-missing-classes",
+                  "failsBuildOnApiIncompatibility": False,
+              },
+              "selection": plan["selection"],
+              "summary": summary_values,
+              "compatibilityChanges": dict(sorted(aggregate_change_counts.items())),
+              "artifacts": report_summaries,
+              "skipped": plan.get("skipped", []),
+          }
+
+          (OUTPUT_DIR / "api-diff-summary.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          with (OUTPUT_DIR / "api-changes.jsonl").open("w", encoding="utf-8") as handle:
+              for record in flat_changes:
+                  handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+          (OUTPUT_DIR / "api-incompatible-changes.json").write_text(
+              json.dumps(
+                  {
+                      "schemaVersion": 1,
+                      "count": len(incompatible_changes),
+                      "changes": incompatible_changes,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+
+          list_files = {
+              "api-diff-binary-incompatible.txt": [
+                  item["coordinate"]
+                  for item in report_summaries
+                  if not item["binaryCompatible"]
+              ],
+              "api-diff-source-incompatible.txt": [
+                  item["coordinate"]
+                  for item in report_summaries
+                  if not item["sourceCompatible"]
+              ],
+              "api-diff-no-api-changes.txt": [
+                  item["coordinate"]
+                  for item in report_summaries
+                  if not item["apiChanged"]
+              ],
+              "api-diff-missing-class-fallback.txt": [
+                  item["coordinate"]
+                  for item in report_summaries
+                  if item["analysisMode"] == "IGNORE_MISSING_CLASSES_FALLBACK"
+              ],
+          }
+          for filename, values in list_files.items():
+              values = sorted(values)
+              (OUTPUT_DIR / filename).write_text(
+                  "\n".join(values) + ("\n" if values else ""),
+                  encoding="utf-8",
+              )
+
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open(
+              "a", encoding="utf-8"
+          ) as summary_file:
+              summary_file.write("\n## Java API compatibility diff\n\n")
+              summary_file.write(
+                  f"- Analyzed Java JAR pairs: **{summary_values['analyzedPairCount']}**\n"
+              )
+              summary_file.write(
+                  f"- Pairs with API changes: **{summary_values['apiChangedPairCount']}**\n"
+              )
+              summary_file.write(
+                  f"- Binary-incompatible pairs: **{summary_values['binaryIncompatiblePairCount']}**\n"
+              )
+              summary_file.write(
+                  f"- Source-incompatible pairs: **{summary_values['sourceIncompatiblePairCount']}**\n"
+              )
+              summary_file.write(
+                  f"- Changed API symbols: **{summary_values['changedSymbolCount']}**\n"
+              )
+              summary_file.write(
+                  f"- Incompatible API symbols: **{summary_values['incompatibleSymbolCount']}**\n"
+              )
+              summary_file.write(
+                  f"- Missing-class fallbacks: **{summary_values['fallbackPairCount']}**\n"
+              )
+              summary_file.write(
+                  f"- Skipped non-Java/resource/native pairs: **{summary_values['skippedPairCount']}**\n\n"
+              )
+
+              if incompatible_changes:
+                  summary_file.write("### Incompatible API symbols\n\n")
+                  summary_file.write(
+                      "| Dependency | Symbol | Status | Binary | Source | Reasons |\n"
+                  )
+                  summary_file.write("|---|---|---|:---:|:---:|---|\n")
+                  for item in incompatible_changes[:50]:
+                      reasons = ", ".join(
+                          change["type"] for change in item["compatibilityChanges"]
+                      ) or "nested incompatibility"
+                      summary_file.write(
+                          f"| `{item['coordinate']}` | `{item['signature']}` | "
+                          f"{item['changeStatus']} | "
+                          f"{'yes' if item['binaryCompatible'] else '**no**'} | "
+                          f"{'yes' if item['sourceCompatible'] else '**no**'} | "
+                          f"{reasons} |\n"
+                      )
+              else:
+                  summary_file.write("No source- or binary-incompatible API symbols found.\n")
+          PY
+
+      - name: Create empty Java API diff result
+        if: steps.api-plan.outputs.count == '0'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/pr-change
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+          plan = json.loads(
+              (output_dir / "api-diff-plan.json").read_text(encoding="utf-8")
+          )
+
+          (output_dir / "api-diff" / "reports").mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          summary = {
+              "schemaVersion": 1,
+              "tool": {
+                  "name": "japicmp",
+                  "version": os.environ["JAPICMP_VERSION"],
+                  "sha256": os.environ["JAPICMP_SHA256"],
+                  "accessModifier": "PROTECTED",
+                  "onlyModified": True,
+                  "annotations": True,
+                  "syntheticMembers": False,
+                  "markdownReport": True,
+                  "strictClasspathFirst": True,
+                  "fallbackOnlyForMissingClasses": True,
+                  "pairTimeoutSeconds": int(
+                      os.environ.get("JAPICMP_PAIR_TIMEOUT_SECONDS", "180")
+                  ),
+                  "missingClassFallback": "--ignore-missing-classes",
+                  "failsBuildOnApiIncompatibility": False,
+              },
+              "selection": plan["selection"],
+              "summary": {
+                  "analyzedPairCount": 0,
+                  "strictPairCount": 0,
+                  "fallbackPairCount": 0,
+                  "apiChangedPairCount": 0,
+                  "binaryIncompatiblePairCount": 0,
+                  "sourceIncompatiblePairCount": 0,
+                  "changedClassCount": 0,
+                  "changedMethodCount": 0,
+                  "changedConstructorCount": 0,
+                  "changedFieldCount": 0,
+                  "changedSymbolCount": 0,
+                  "incompatibleSymbolCount": 0,
+                  "skippedPairCount": len(plan.get("skipped", [])),
+              },
+              "compatibilityChanges": {},
+              "artifacts": [],
+              "skipped": plan.get("skipped", []),
+          }
+
+          (output_dir / "api-diff-summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          (output_dir / "api-incompatible-changes.json").write_text(
+              json.dumps(
+                  {"schemaVersion": 1, "count": 0, "changes": []},
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          (output_dir / "japicmp-tool.json").write_text(
+              json.dumps(
+                  {
+                      "artifact": (
+                          "com.github.siom79.japicmp:japicmp:"
+                          f"{os.environ['JAPICMP_VERSION']}:jar:jar-with-dependencies"
+                      ),
+                      "downloaded": False,
+                      "sha256": os.environ["JAPICMP_SHA256"],
+                      "version": os.environ["JAPICMP_VERSION"],
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+
+          for filename in (
+              "api-changes.jsonl",
+              "api-diff-binary-incompatible.txt",
+              "api-diff-source-incompatible.txt",
+              "api-diff-no-api-changes.txt",
+              "api-diff-missing-class-fallback.txt",
+          ):
+              (output_dir / filename).write_text("", encoding="utf-8")
+
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open(
+              "a", encoding="utf-8"
+          ) as handle:
+              handle.write("\n## Java API compatibility diff\n\n")
+              handle.write("No changed Java bytecode JAR pairs were selected.\n")
+          PY
+
+      - name: Clean temporary Maven dependency copies
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf -- \
+            "${RUNNER_TEMP}/resolved-jars" \
+            "${RUNNER_TEMP}/japicmp-tool"
 
       - name: Create checksums
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -976,10 +2181,11 @@ jobs:
               > SHA256SUMS
           )
 
-      - name: Upload dependency comparison and JAR pairs
+      - name: Upload dependency comparison, JAR pairs and API diffs
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: pr-dependency-jars-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          name: pr-dependency-api-diff-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           path: ${{ runner.temp }}/pr-change
           if-no-files-found: error
           retention-days: 14
