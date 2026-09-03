@@ -1,0 +1,156 @@
+name: PR 01 - Capture Maven change
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-capture-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  capture-change:
+    name: Capture Maven change
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout exact PR commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Capture Maven change
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          output_dir="${RUNNER_TEMP}/pr-change"
+
+          rm -rf -- "${output_dir}"
+          mkdir -p -- "${output_dir}"
+
+          echo "Base SHA: ${BASE_SHA}"
+          echo "Head SHA: ${HEAD_SHA}"
+
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git fetch \
+              --no-tags \
+              --depth=1 \
+              origin \
+              "${BASE_SHA}"
+          fi
+
+          diff_range="${BASE_SHA}...${HEAD_SHA}"
+
+          pom_pathspecs=(
+            "pom.xml"
+            ":(glob)**/pom.xml"
+          )
+
+          git diff \
+            --name-only \
+            --no-ext-diff \
+            --no-textconv \
+            "${diff_range}" \
+            -- "${pom_pathspecs[@]}" \
+            | sort -u \
+            > "${output_dir}/changed-poms.txt"
+
+          git diff \
+            --no-ext-diff \
+            --no-textconv \
+            --unified=3 \
+            "${diff_range}" \
+            -- "${pom_pathspecs[@]}" \
+            > "${output_dir}/pom.patch"
+
+          OUTPUT_DIR="${output_dir}" python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          event_path = Path(os.environ["GITHUB_EVENT_PATH"])
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+
+          event = json.loads(event_path.read_text(encoding="utf-8"))
+          pull_request = event["pull_request"]
+
+          metadata = {
+              "repository": event["repository"]["full_name"],
+              "pullRequest": event["number"],
+              "title": pull_request["title"],
+              "author": pull_request["user"]["login"],
+              "base": {
+                  "ref": pull_request["base"]["ref"],
+                  "sha": pull_request["base"]["sha"],
+              },
+              "head": {
+                  "ref": pull_request["head"]["ref"],
+                  "sha": pull_request["head"]["sha"],
+              },
+          }
+
+          metadata_file = output_dir / "metadata.json"
+          metadata_file.write_text(
+              json.dumps(
+                  metadata,
+                  indent=2,
+                  sort_keys=True,
+                  ensure_ascii=False,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          (
+            cd "${output_dir}"
+
+            sha256sum \
+              metadata.json \
+              changed-poms.txt \
+              pom.patch \
+              > SHA256SUMS
+          )
+
+          {
+            echo "## PR Maven change captured"
+            echo
+            echo "- PR: #${PR_NUMBER}"
+            echo "- Base: \`${BASE_SHA}\`"
+            echo "- Head: \`${HEAD_SHA}\`"
+            echo
+
+            if [[ -s "${output_dir}/changed-poms.txt" ]]; then
+              echo "### Changed POM files"
+              echo
+
+              while IFS= read -r file; do
+                printf -- '- `%s`\n' "${file}"
+              done < "${output_dir}/changed-poms.txt"
+            else
+              echo "No Maven POM changes detected."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload captured PR change
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-change-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/pr-change
+          if-no-files-found: error
+          retention-days: 14
