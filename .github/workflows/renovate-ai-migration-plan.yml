@@ -1,0 +1,355 @@
+name: PR 06 - AI migration plan
+
+on:
+  workflow_run:
+    workflows:
+      - "PR 05 - Map incompatible and removed Maven API usages"
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ai-migration-plan-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+env:
+  OPENAI_MODEL: gpt-5.4-mini-2026-03-17
+  AI_REASONING_EFFORT: medium
+  AI_MAX_OUTPUT_TOKENS: "12000"
+
+jobs:
+  plan-migration:
+    name: Build validated AI migration plan
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      (github.event.workflow_run.actor.login == 'renovate[bot]' ||
+       github.event.workflow_run.actor.login == github.repository_owner)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout trusted pipeline code from default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download Step 5 analysis artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: pr-dependency-source-impact-*
+          path: ${{ runner.temp }}/step5-artifact
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify trusted analysis input
+        id: verify
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/step5-artifact
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          required_files=(
+            metadata.json
+            dependency-changes.json
+            api-usage-summary.json
+            api-usage-impact.json
+            api-usages.jsonl
+            api-changes.jsonl
+            added-dependency-type-index.json
+            removed-dependency-impact.json
+            SHA256SUMS
+          )
+
+          for file in "${required_files[@]}"; do
+            if [[ ! -s "${ARTIFACT_DIR}/${file}" ]]; then
+              echo "::error::Required Step 5 artifact file missing or empty: ${file}"
+              exit 1
+            fi
+          done
+
+          actual_repository="$(jq -r '.repository' "${ARTIFACT_DIR}/metadata.json")"
+          actual_head_sha="$(jq -r '.head.sha' "${ARTIFACT_DIR}/metadata.json")"
+          pr_number="$(jq -r '.pullRequest' "${ARTIFACT_DIR}/metadata.json")"
+
+          if [[ "${actual_repository}" != "${EXPECTED_REPOSITORY}" ]]; then
+            echo "::error::Artifact repository mismatch: ${actual_repository}"
+            exit 1
+          fi
+
+          if [[ "${actual_head_sha}" != "${EXPECTED_HEAD_SHA}" ]]; then
+            echo "::error::Artifact HEAD SHA mismatch: artifact=${actual_head_sha}, workflow_run=${EXPECTED_HEAD_SHA}"
+            exit 1
+          fi
+
+          (
+            cd "${ARTIFACT_DIR}"
+            sha256sum --check --strict SHA256SUMS
+          )
+
+          echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=${actual_head_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify migration planner implementation
+        shell: bash
+        env:
+          PLANNER: .github/scripts/ai-migration-planner.py
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "${PLANNER}" ]]; then
+            echo "::error::Migration planner script is missing: ${PLANNER}"
+            exit 1
+          fi
+
+          python3 -m py_compile "${PLANNER}"
+          sha256sum "${PLANNER}" | tee "${RUNNER_TEMP}/planner-sha256.txt"
+
+      - name: Build deterministic AI input and candidate set
+        id: build
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/step5-artifact
+          OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
+          PLANNER: .github/scripts/ai-migration-planner.py
+        run: |
+          set -euo pipefail
+
+          rm -rf -- "${OUTPUT_DIR}"
+          mkdir -p -- "${OUTPUT_DIR}"
+
+          result="$(python3 "${PLANNER}" build \
+            --artifact-dir "${ARTIFACT_DIR}" \
+            --output-dir "${OUTPUT_DIR}")"
+
+          printf '%s\n' "${result}" | tee "${OUTPUT_DIR}/ai-migration-build-result.json"
+
+          impact_count="$(printf '%s' "${result}" | jq -r '.impactCount')"
+          needs_ai="$(printf '%s' "${result}" | jq -r '.needsAi')"
+
+          echo "impact_count=${impact_count}" >> "${GITHUB_OUTPUT}"
+          echo "needs_ai=${needs_ai}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build OpenAI Structured Outputs request
+        if: steps.build.outputs.needs_ai == 'true'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
+          MODEL: ${{ env.OPENAI_MODEL }}
+          REASONING_EFFORT: ${{ env.AI_REASONING_EFFORT }}
+          MAX_OUTPUT_TOKENS: ${{ env.AI_MAX_OUTPUT_TOKENS }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ["OUTPUT_DIR"])
+          evidence = json.loads((out / "ai-migration-input.json").read_text(encoding="utf-8"))
+          schema = json.loads((out / "ai-migration-output-schema.json").read_text(encoding="utf-8"))
+          instructions = (out / "ai-migration-instructions.txt").read_text(encoding="utf-8").strip()
+
+          request = {
+              "model": os.environ["MODEL"],
+              "store": False,
+              "temperature": 0,
+              "reasoning": {
+                  "effort": os.environ["REASONING_EFFORT"]
+              },
+              "max_output_tokens": int(os.environ["MAX_OUTPUT_TOKENS"]),
+              "input": [
+                  {
+                      "role": "developer",
+                      "content": [
+                          {
+                              "type": "input_text",
+                              "text": instructions,
+                          }
+                      ],
+                  },
+                  {
+                      "role": "user",
+                      "content": [
+                          {
+                              "type": "input_text",
+                              "text": "Migration evidence JSON follows. Use only this data.\n" + json.dumps(evidence, sort_keys=True),
+                          }
+                      ],
+                  },
+              ],
+              "text": {
+                  "format": {
+                      "type": "json_schema",
+                      "name": "dependency_migration_plan",
+                      "strict": True,
+                      "schema": schema,
+                  }
+              },
+          }
+
+          (out / "openai-request.json").write_text(
+              json.dumps(request, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Request AI migration plan
+        if: steps.build.outputs.needs_ai == 'true'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+            echo "::error::Repository secret OPENAI_API_KEY is not configured."
+            exit 1
+          fi
+
+          http_code="$(curl \
+            --silent \
+            --show-error \
+            --connect-timeout 20 \
+            --max-time 300 \
+            --retry 2 \
+            --retry-all-errors \
+            --output "${OUTPUT_DIR}/openai-response.json" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${OPENAI_API_KEY}" \
+            --header 'Content-Type: application/json' \
+            --data-binary "@${OUTPUT_DIR}/openai-request.json" \
+            https://api.openai.com/v1/responses)"
+
+          if [[ "${http_code}" != "200" ]]; then
+            error_message="$(jq -r '.error.message // .error // "unknown OpenAI API error"' "${OUTPUT_DIR}/openai-response.json" 2>/dev/null || true)"
+            echo "::error::OpenAI Responses API returned HTTP ${http_code}: ${error_message}"
+            exit 1
+          fi
+
+          status="$(jq -r '.status // ""' "${OUTPUT_DIR}/openai-response.json")"
+          if [[ "${status}" != "completed" ]]; then
+            echo "::error::OpenAI response did not complete successfully. status=${status}"
+            jq '{id,status,error,incomplete_details}' "${OUTPUT_DIR}/openai-response.json" || true
+            exit 1
+          fi
+
+          jq -r '[
+            .output[]?
+            | select(.type == "message")
+            | .content[]?
+            | select(.type == "output_text")
+            | .text
+          ] | join("")' \
+            "${OUTPUT_DIR}/openai-response.json" \
+            > "${OUTPUT_DIR}/ai-migration-plan-raw.json"
+
+          if [[ ! -s "${OUTPUT_DIR}/ai-migration-plan-raw.json" ]]; then
+            echo "::error::OpenAI response contained no structured output text."
+            exit 1
+          fi
+
+          jq -e . "${OUTPUT_DIR}/ai-migration-plan-raw.json" >/dev/null
+
+      - name: Validate and enrich AI migration plan
+        if: steps.build.outputs.needs_ai == 'true'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
+          PLANNER: .github/scripts/ai-migration-planner.py
+        run: |
+          set -euo pipefail
+
+          python3 "${PLANNER}" validate \
+            --input "${OUTPUT_DIR}/ai-migration-input.json" \
+            --raw-plan "${OUTPUT_DIR}/ai-migration-plan-raw.json" \
+            --output-dir "${OUTPUT_DIR}"
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ["OUTPUT_DIR"])
+          response = json.loads((out / "openai-response.json").read_text(encoding="utf-8"))
+          metadata = {
+              "provider": "OpenAI",
+              "endpoint": "Responses API",
+              "responseId": response.get("id"),
+              "model": response.get("model"),
+              "status": response.get("status"),
+              "store": False,
+              "usage": response.get("usage"),
+          }
+          (out / "ai-provider-metadata.json").write_text(
+              json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Create deterministic empty plan when no source impacts exist
+        if: steps.build.outputs.needs_ai == 'false'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
+          PLANNER: .github/scripts/ai-migration-planner.py
+        run: |
+          set -euo pipefail
+
+          python3 "${PLANNER}" empty-plan \
+            --input "${OUTPUT_DIR}/ai-migration-input.json" \
+            --output-dir "${OUTPUT_DIR}"
+
+      - name: Create checksums and workflow summary
+        if: always() && steps.build.outcome == 'success'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
+          MODEL: ${{ env.OPENAI_MODEL }}
+        run: |
+          set -euo pipefail
+
+          if [[ -d "${OUTPUT_DIR}" ]]; then
+            (
+              cd "${OUTPUT_DIR}"
+              find . -type f ! -name SHA256SUMS -print0 \
+                | sort -z \
+                | xargs -0 sha256sum \
+                > SHA256SUMS
+            )
+          fi
+
+          if [[ -s "${OUTPUT_DIR}/ai-migration-plan-summary.md" ]]; then
+            cat "${OUTPUT_DIR}/ai-migration-plan-summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          {
+            echo
+            echo "## Planner execution"
+            echo
+            echo "- Model snapshot: \`${MODEL}\`"
+            echo "- AI required: \`${{ steps.build.outputs.needs_ai }}\`"
+            echo "- Planned impacts: \`${{ steps.build.outputs.impact_count }}\`"
+            echo "- No source changes were applied."
+            echo "- No OpenRewrite recipe was generated."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload AI migration plan
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-ai-migration-plan-${{ steps.verify.outputs.pr_number }}-${{ steps.verify.outputs.head_sha }}
+          path: ${{ runner.temp }}/ai-migration-plan
+          if-no-files-found: error
+          retention-days: 14
