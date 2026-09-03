@@ -1,4 +1,4 @@
-name: PR 01 - Capture Maven change
+name: Capture Maven change
 
 on:
   pull_request:
