@@ -1,4 +1,4 @@
-name: Capture Maven change
+name: PR 02 - Compare Maven dependencies
 
 on:
   pull_request:
@@ -11,13 +11,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr-capture-${{ github.event.pull_request.number }}
+  group: pr-dependency-compare-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-jobs:
-  capture-change:
-    name: Capture Maven change
+env:
+  JAVA_VERSION: "17"
+  MAVEN_DEPENDENCY_PLUGIN_VERSION: "3.11.0"
 
+jobs:
+  compare-maven-dependencies:
+    name: Compare resolved Maven dependencies
     runs-on: ubuntu-latest
 
     steps:
@@ -28,10 +31,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Capture Maven change
+      - name: Set up Java
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Prepare PR comparison
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_BRANCH_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
@@ -39,34 +48,25 @@ jobs:
           export LC_ALL=C
 
           output_dir="${RUNNER_TEMP}/pr-change"
+          base_dir="${RUNNER_TEMP}/dependency-base"
+          head_dir="${RUNNER_TEMP}/dependency-head"
 
-          rm -rf -- "${output_dir}"
+          rm -rf -- "${output_dir}" "${base_dir}" "${head_dir}"
           mkdir -p -- "${output_dir}"
 
-          echo "Base SHA: ${BASE_SHA}"
-          echo "Head SHA: ${HEAD_SHA}"
-
-          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            git fetch \
-              --no-tags \
-              --depth=1 \
-              origin \
-              "${BASE_SHA}"
+          if ! git cat-file -e "${BASE_BRANCH_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "${BASE_BRANCH_SHA}"
           fi
 
-          diff_range="${BASE_SHA}...${HEAD_SHA}"
-
-          pom_pathspecs=(
-            "pom.xml"
-            ":(glob)**/pom.xml"
-          )
+          comparison_base_sha="$(git merge-base "${BASE_BRANCH_SHA}" "${HEAD_SHA}")"
+          echo "COMPARISON_BASE_SHA=${comparison_base_sha}" >> "${GITHUB_ENV}"
 
           git diff \
             --name-only \
             --no-ext-diff \
             --no-textconv \
-            "${diff_range}" \
-            -- "${pom_pathspecs[@]}" \
+            "${comparison_base_sha}..${HEAD_SHA}" \
+            -- pom.xml ':(glob)**/pom.xml' \
             | sort -u \
             > "${output_dir}/changed-poms.txt"
 
@@ -74,71 +74,58 @@ jobs:
             --no-ext-diff \
             --no-textconv \
             --unified=3 \
-            "${diff_range}" \
-            -- "${pom_pathspecs[@]}" \
+            "${comparison_base_sha}..${HEAD_SHA}" \
+            -- pom.xml ':(glob)**/pom.xml' \
             > "${output_dir}/pom.patch"
 
-          OUTPUT_DIR="${output_dir}" python3 <<'PY'
+          OUTPUT_DIR="${output_dir}" \
+          COMPARISON_BASE_SHA="${comparison_base_sha}" \
+          python3 <<'PY'
           import json
           import os
           from pathlib import Path
 
-          event_path = Path(os.environ["GITHUB_EVENT_PATH"])
-          output_dir = Path(os.environ["OUTPUT_DIR"])
-
-          event = json.loads(event_path.read_text(encoding="utf-8"))
-          pull_request = event["pull_request"]
+          event = json.loads(
+              Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8")
+          )
+          pr = event["pull_request"]
 
           metadata = {
               "repository": event["repository"]["full_name"],
               "pullRequest": event["number"],
-              "title": pull_request["title"],
-              "author": pull_request["user"]["login"],
+              "title": pr["title"],
+              "author": pr["user"]["login"],
               "base": {
-                  "ref": pull_request["base"]["ref"],
-                  "sha": pull_request["base"]["sha"],
+                  "ref": pr["base"]["ref"],
+                  "branchSha": pr["base"]["sha"],
+                  "comparisonSha": os.environ["COMPARISON_BASE_SHA"],
               },
               "head": {
-                  "ref": pull_request["head"]["ref"],
-                  "sha": pull_request["head"]["sha"],
+                  "ref": pr["head"]["ref"],
+                  "sha": pr["head"]["sha"],
               },
           }
 
-          metadata_file = output_dir / "metadata.json"
-          metadata_file.write_text(
-              json.dumps(
-                  metadata,
-                  indent=2,
-                  sort_keys=True,
-                  ensure_ascii=False,
-              )
-              + "\n",
+          (Path(os.environ["OUTPUT_DIR"]) / "metadata.json").write_text(
+              json.dumps(metadata, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
           PY
 
-          (
-            cd "${output_dir}"
-
-            sha256sum \
-              metadata.json \
-              changed-poms.txt \
-              pom.patch \
-              > SHA256SUMS
-          )
+          git worktree prune
+          git worktree add --detach "${base_dir}" "${comparison_base_sha}"
+          git worktree add --detach "${head_dir}" "${HEAD_SHA}"
 
           {
             echo "## PR Maven change captured"
             echo
             echo "- PR: #${PR_NUMBER}"
-            echo "- Base: \`${BASE_SHA}\`"
+            echo "- Comparison base: \`${comparison_base_sha}\`"
             echo "- Head: \`${HEAD_SHA}\`"
             echo
 
             if [[ -s "${output_dir}/changed-poms.txt" ]]; then
               echo "### Changed POM files"
-              echo
-
               while IFS= read -r file; do
                 printf -- '- `%s`\n' "${file}"
               done < "${output_dir}/changed-poms.txt"
@@ -147,10 +134,267 @@ jobs:
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Upload captured PR change
+      - name: Resolve base and PR dependency trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          output_dir="${RUNNER_TEMP}/pr-change"
+
+          resolve_tree() {
+            local label="$1"
+            local project_dir="$2"
+            local output_file="${output_dir}/${label}-dependency-tree.json"
+            local -a mvn_command
+
+            if [[ -f "${project_dir}/mvnw" ]]; then
+              chmod +x "${project_dir}/mvnw"
+              mvn_command=("./mvnw")
+            else
+              mvn_command=("mvn")
+            fi
+
+            echo "::group::Resolve ${label} dependency tree"
+
+            (
+              cd "${project_dir}"
+
+              "${mvn_command[@]}" --version \
+                2>&1 | tee "${output_dir}/${label}-maven-version.txt"
+
+              "${mvn_command[@]}" \
+                -B \
+                -ntp \
+                -Dstyle.color=never \
+                -DskipTests \
+                "org.apache.maven.plugins:maven-dependency-plugin:${MAVEN_DEPENDENCY_PLUGIN_VERSION}:tree" \
+                -DoutputType=json \
+                -DoutputFile="${output_file}" \
+                -DappendOutput=false
+            )
+
+            test -s "${output_file}"
+            python3 -m json.tool "${output_file}" >/dev/null
+            echo "::endgroup::"
+          }
+
+          java -version 2>&1 | tee "${output_dir}/java-version.txt"
+
+          resolve_tree "base" "${RUNNER_TEMP}/dependency-base"
+          resolve_tree "head" "${RUNNER_TEMP}/dependency-head"
+
+      - name: Create dependency change model
+        shell: bash
+        env:
+          BASE_BRANCH_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          OUTPUT_DIR="${RUNNER_TEMP}/pr-change" python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+
+          def flatten(path):
+              root = json.loads(path.read_text(encoding="utf-8"))
+              result = {}
+
+              def visit(node, depth):
+                  key = (
+                      node.get("groupId", ""),
+                      node.get("artifactId", ""),
+                      node.get("type") or "jar",
+                      node.get("classifier") or "",
+                  )
+                  entry = result.setdefault(
+                      key,
+                      {
+                          "groupId": key[0],
+                          "artifactId": key[1],
+                          "type": key[2],
+                          "classifier": key[3],
+                          "versions": set(),
+                          "scopes": set(),
+                          "minimumDepth": depth,
+                      },
+                  )
+
+                  if node.get("version"):
+                      entry["versions"].add(str(node["version"]))
+                  if node.get("scope"):
+                      entry["scopes"].add(str(node["scope"]))
+                  entry["minimumDepth"] = min(entry["minimumDepth"], depth)
+
+                  for child in node.get("children") or []:
+                      visit(child, depth + 1)
+
+              for child in root.get("children") or []:
+                  visit(child, 1)
+
+              return result
+
+          def value(entry):
+              if entry is None:
+                  return None
+
+              versions = sorted(entry["versions"])
+              return {
+                  "version": versions[0] if len(versions) == 1 else None,
+                  "versions": versions,
+                  "scopes": sorted(entry["scopes"]),
+                  "minimumDepth": entry["minimumDepth"],
+                  "direct": entry["minimumDepth"] == 1,
+              }
+
+          base = flatten(output_dir / "base-dependency-tree.json")
+          head = flatten(output_dir / "head-dependency-tree.json")
+          changes = []
+
+          for key in sorted(set(base) | set(head)):
+              old = value(base.get(key))
+              new = value(head.get(key))
+
+              if old == new:
+                  continue
+
+              if old is None:
+                  change_type = "ADDED"
+              elif new is None:
+                  change_type = "REMOVED"
+              elif old["versions"] != new["versions"]:
+                  change_type = "VERSION_CHANGED"
+              else:
+                  change_type = "METADATA_CHANGED"
+
+              changes.append(
+                  {
+                      "changeType": change_type,
+                      "groupId": key[0],
+                      "artifactId": key[1],
+                      "type": key[2],
+                      "classifier": key[3],
+                      "old": old,
+                      "new": new,
+                  }
+              )
+
+          counts = {
+              change_type: sum(
+                  1 for change in changes
+                  if change["changeType"] == change_type
+              )
+              for change_type in (
+                  "VERSION_CHANGED",
+                  "ADDED",
+                  "REMOVED",
+                  "METADATA_CHANGED",
+              )
+          }
+
+          result = {
+              "schemaVersion": 1,
+              "base": {
+                  "branchSha": os.environ["BASE_BRANCH_SHA"],
+                  "comparisonSha": os.environ["COMPARISON_BASE_SHA"],
+                  "dependencyCount": len(base),
+              },
+              "head": {
+                  "sha": os.environ["HEAD_SHA"],
+                  "dependencyCount": len(head),
+              },
+              "resolver": {
+                  "plugin": "org.apache.maven.plugins:maven-dependency-plugin",
+                  "pluginVersion": os.environ["MAVEN_DEPENDENCY_PLUGIN_VERSION"],
+                  "goal": "tree",
+                  "outputType": "json",
+                  "scopeFilter": None,
+              },
+              "summary": counts,
+              "changes": changes,
+          }
+
+          (output_dir / "dependency-changes.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          version_changes = [
+              change for change in changes
+              if change["changeType"] == "VERSION_CHANGED"
+          ]
+
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open(
+              "a", encoding="utf-8"
+          ) as summary:
+              summary.write("\n## Resolved Maven dependency comparison\n\n")
+              summary.write(f"- Base dependencies: **{len(base)}**\n")
+              summary.write(f"- PR dependencies: **{len(head)}**\n")
+              summary.write(
+                  f"- Version changes: **{counts['VERSION_CHANGED']}**\n"
+              )
+              summary.write(f"- Added: **{counts['ADDED']}**\n")
+              summary.write(f"- Removed: **{counts['REMOVED']}**\n")
+              summary.write(
+                  f"- Metadata changes: **{counts['METADATA_CHANGED']}**\n\n"
+              )
+
+              if version_changes:
+                  summary.write("### Version changes\n\n")
+                  summary.write("| Dependency | Old | New | Direct |\n")
+                  summary.write("|---|---:|---:|:---:|\n")
+
+                  for change in version_changes[:50]:
+                      classifier = (
+                          f":{change['classifier']}"
+                          if change["classifier"]
+                          else ""
+                      )
+                      dependency = (
+                          f"{change['groupId']}:{change['artifactId']}:"
+                          f"{change['type']}{classifier}"
+                      )
+                      old_version = change["old"]["version"] or ", ".join(
+                          change["old"]["versions"]
+                      )
+                      new_version = change["new"]["version"] or ", ".join(
+                          change["new"]["versions"]
+                      )
+                      direct = "yes" if change["new"]["direct"] else "no"
+
+                      summary.write(
+                          f"| `{dependency}` | `{old_version}` | "
+                          f"`{new_version}` | {direct} |\n"
+                      )
+              else:
+                  summary.write("No resolved dependency version changes found.\n")
+          PY
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          (
+            cd "${RUNNER_TEMP}/pr-change"
+
+            find . \
+              -maxdepth 1 \
+              -type f \
+              ! -name SHA256SUMS \
+              -printf '%P\0' \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS
+          )
+
+      - name: Upload dependency comparison
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: pr-change-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          name: pr-dependency-change-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           path: ${{ runner.temp }}/pr-change
           if-no-files-found: error
           retention-days: 14
