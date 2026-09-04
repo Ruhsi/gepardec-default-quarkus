@@ -1,74 +1,70 @@
-name: PR 07 - Generate OpenRewrite recipe
+name: PR 09 - Commit verified OpenRewrite migration
 
 on:
-  workflow_run:
-    workflows:
-      - PR 06 - AI migration plan
-    types:
-      - completed
   workflow_dispatch:
     inputs:
-      step6_run_id:
-        description: GitHub Actions run ID of a successful PR 06 - AI migration plan run
+      step8_run_id:
+        description: GitHub Actions run ID of a successful PR 08 - Apply OpenRewrite migration run
         required: true
         type: string
+      confirm_push:
+        description: Confirm that the verified patch should be committed and pushed to the PR branch
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   actions: read
-  contents: read
+  contents: write
+  pull-requests: read
 
 jobs:
-  generate-recipe:
-    name: Generate deterministic OpenRewrite recipe
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+  commit-verified-patch:
+    name: Commit and push verified migration
+    if: inputs.confirm_push == true
     runs-on: ubuntu-latest
 
-    env:
-      GENERATOR_SHA256: "c648c5b3124d80a79707fe722b08b379b163a17c809d1ea20b3dfeddb1e3dc43"
-
     steps:
-      - name: Resolve Step 6 run
+      - name: Resolve and verify Step 8 run
         id: source
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          AUTO_RUN_ID: ${{ github.event.workflow_run.id }}
-          MANUAL_RUN_ID: ${{ inputs.step6_run_id }}
+          STEP8_RUN_ID: ${{ inputs.step8_run_id }}
         run: |
           set -euo pipefail
 
-          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            run_id="${MANUAL_RUN_ID}"
-          else
-            run_id="${AUTO_RUN_ID}"
-          fi
+          run_id="${STEP8_RUN_ID}"
 
           if [[ ! "${run_id}" =~ ^[0-9]+$ ]]; then
-            echo "::error::Invalid Step 6 run ID: ${run_id}"
+            echo "::error::Invalid Step 8 run ID: ${run_id}"
             exit 1
           fi
 
           run_json="$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}")"
           run_name="$(jq -r '.name' <<<"${run_json}")"
           conclusion="$(jq -r '.conclusion' <<<"${run_json}")"
+          run_repository="$(jq -r '.repository.full_name' <<<"${run_json}")"
 
-          if [[ "${run_name}" != "PR 06 - AI migration plan" ]]; then
-            echo "::error::Run ${run_id} belongs to '${run_name}', not 'PR 06 - AI migration plan'."
+          if [[ "${run_repository}" != "${REPOSITORY}" ]]; then
+            echo "::error::Step 8 run belongs to '${run_repository}', not '${REPOSITORY}'."
+            exit 1
+          fi
+
+          if [[ "${run_name}" != "PR 08 - Apply OpenRewrite migration" ]]; then
+            echo "::error::Run ${run_id} belongs to '${run_name}', not 'PR 08 - Apply OpenRewrite migration'."
             exit 1
           fi
 
           if [[ "${conclusion}" != "success" ]]; then
-            echo "::error::Step 6 run ${run_id} conclusion is '${conclusion}', expected 'success'."
+            echo "::error::Step 8 run ${run_id} conclusion is '${conclusion}', expected 'success'."
             exit 1
           fi
 
           echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
 
-      - name: Download Step 6 artifact
+      - name: Download and verify Step 8 artifact
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,129 +73,319 @@ jobs:
         run: |
           set -euo pipefail
 
-          input_dir="${RUNNER_TEMP}/step6-input"
+          input_dir="${RUNNER_TEMP}/step8-input"
           rm -rf -- "${input_dir}"
           mkdir -p -- "${input_dir}"
 
-          artifact_name="$(
+          mapfile -t artifact_names < <(
             gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+              --paginate \
               --jq '.artifacts[] | select(.expired == false) | .name' \
-              | grep '^pr-ai-migration-plan-' \
-              | head -n 1
-          )"
+              | grep '^pr-openrewrite-verification-' || true
+          )
 
-          if [[ -z "${artifact_name}" ]]; then
-            echo "::error::No non-expired pr-ai-migration-plan-* artifact found on Step 6 run ${RUN_ID}."
+          if [[ "${#artifact_names[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one non-expired pr-openrewrite-verification-* artifact on Step 8 run ${RUN_ID}, found ${#artifact_names[@]}."
+            printf 'Found artifact: %s\n' "${artifact_names[@]:-none}"
             exit 1
           fi
+
+          artifact_name="${artifact_names[0]}"
 
           gh run download "${RUN_ID}" \
             --repo "${REPOSITORY}" \
             --name "${artifact_name}" \
             --dir "${input_dir}"
 
-          plan_path="$(find "${input_dir}" -type f -name ai-migration-plan.json -print -quit)"
-          if [[ -z "${plan_path}" ]]; then
-            echo "::error::ai-migration-plan.json missing from Step 6 artifact."
+          result_path="$(find "${input_dir}" -type f -name step8-result.json -print -quit)"
+          patch_path="$(find "${input_dir}" -type f -name rewrite.patch -print -quit)"
+          changed_files_path="$(find "${input_dir}" -type f -name changed-files.txt -print -quit)"
+          checksum_path="$(find "${input_dir}" -type f -name SHA256SUMS -print -quit)"
+
+          for path in "${result_path}" "${patch_path}" "${changed_files_path}" "${checksum_path}"; do
+            if [[ -z "${path}" || ! -f "${path}" ]]; then
+              echo "::error::Step 8 artifact is incomplete. Missing required file."
+              exit 1
+            fi
+          done
+
+          checksum_dir="$(dirname "${checksum_path}")"
+          (cd "${checksum_dir}" && sha256sum --check --strict SHA256SUMS)
+
+          if [[ "$(jq -r '.successful' "${result_path}")" != "true" ]]; then
+            echo "::error::Step 8 result is not successful."
             exit 1
           fi
 
-          echo "PLAN_PATH=${plan_path}" >> "${GITHUB_ENV}"
-          echo "STEP6_ARTIFACT_NAME=${artifact_name}" >> "${GITHUB_ENV}"
-
-      - name: Checkout trusted generator
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-
-      - name: Verify generator
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          generator="${GITHUB_WORKSPACE}/.github/scripts/openrewrite-recipe-generator.py"
-
-          if [[ ! -s "${generator}" ]]; then
-            echo "::error::OpenRewrite recipe generator not found: ${generator}"
+          if [[ "$(jq -r '.commitCreated' "${result_path}")" != "false" ]]; then
+            echo "::error::Step 8 artifact unexpectedly reports that a commit was already created."
             exit 1
           fi
 
-          printf '%s  %s\n' "${GENERATOR_SHA256}" "${generator}" \
-            | sha256sum --check --strict -
+          if [[ "$(jq -r '.pushPerformed' "${result_path}")" != "false" ]]; then
+            echo "::error::Step 8 artifact unexpectedly reports that a push was already performed."
+            exit 1
+          fi
 
-          python3 -m py_compile "${generator}"
+          pr_number="$(jq -r '.pullRequest // empty' "${result_path}")"
+          head_sha="$(jq -r '.headSha // empty' "${result_path}")"
+          changed_count="$(jq -r '.changedFileCount // 0' "${result_path}")"
 
-      - name: Generate OpenRewrite recipe
-        id: generate
+          if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid pullRequest in step8-result.json: ${pr_number}"
+            exit 1
+          fi
+
+          if [[ ! "${head_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid headSha in step8-result.json: ${head_sha}"
+            exit 1
+          fi
+
+          if [[ ! "${changed_count}" =~ ^[0-9]+$ || "${changed_count}" -lt 1 ]]; then
+            echo "::error::Step 8 verified no changed files; there is nothing to commit."
+            exit 1
+          fi
+
+          if [[ ! -s "${patch_path}" ]]; then
+            echo "::error::Verified rewrite.patch is empty."
+            exit 1
+          fi
+
+          nonempty_changed_files="$(grep -cve '^$' "${changed_files_path}" || true)"
+          if [[ "${nonempty_changed_files}" -ne "${changed_count}" ]]; then
+            echo "::error::changed-files.txt count (${nonempty_changed_files}) does not match step8-result.json (${changed_count})."
+            exit 1
+          fi
+
+          echo "STEP8_INPUT_DIR=${input_dir}" >> "${GITHUB_ENV}"
+          echo "STEP8_ARTIFACT_NAME=${artifact_name}" >> "${GITHUB_ENV}"
+          echo "STEP8_RESULT_PATH=${result_path}" >> "${GITHUB_ENV}"
+          echo "VERIFIED_PATCH_PATH=${patch_path}" >> "${GITHUB_ENV}"
+          echo "VERIFIED_CHANGED_FILES_PATH=${changed_files_path}" >> "${GITHUB_ENV}"
+          echo "PR_NUMBER=${pr_number}" >> "${GITHUB_ENV}"
+          echo "PR_HEAD_SHA=${head_sha}" >> "${GITHUB_ENV}"
+          echo "VERIFIED_CHANGED_COUNT=${changed_count}" >> "${GITHUB_ENV}"
+
+      - name: Verify PR is still at analyzed head and is writable
         shell: bash
         env:
-          OUTPUT_DIR: ${{ runner.temp }}/step7-output
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          rm -rf -- "${OUTPUT_DIR}"
-          mkdir -p -- "${OUTPUT_DIR}/analysis-tools"
+          pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
 
-          pr_number="$(jq -r '.pullRequest // empty' "${PLAN_PATH}")"
-          if [[ -z "${pr_number}" || ! "${pr_number}" =~ ^[0-9]+$ ]]; then
-            echo "::error::Invalid or missing pullRequest in ai-migration-plan.json"
+          state="$(jq -r '.state' <<<"${pr_json}")"
+          current_head_sha="$(jq -r '.head.sha' <<<"${pr_json}")"
+          head_ref="$(jq -r '.head.ref' <<<"${pr_json}")"
+          head_repository="$(jq -r '.head.repo.full_name // empty' <<<"${pr_json}")"
+
+          if [[ "${state}" != "open" ]]; then
+            echo "::error::PR #${PR_NUMBER} is '${state}', expected 'open'."
             exit 1
           fi
 
-          recipe_name="com.gepardec.renovate.PR${pr_number}DependencyMigration"
-          display_name="PR ${pr_number} dependency migration"
+          if [[ "${current_head_sha}" != "${PR_HEAD_SHA}" ]]; then
+            echo "::error::PR #${PR_NUMBER} moved since Step 8. Verified HEAD=${PR_HEAD_SHA}, current HEAD=${current_head_sha}. Re-run Steps 5-8 first."
+            exit 1
+          fi
 
-          python3 "${GITHUB_WORKSPACE}/.github/scripts/openrewrite-recipe-generator.py" \
-            --plan "${PLAN_PATH}" \
-            --recipe "${OUTPUT_DIR}/rewrite.yml" \
-            --manifest "${OUTPUT_DIR}/openrewrite-recipe-manifest.json" \
-            --recipe-name "${recipe_name}" \
-            --display-name "${display_name}"
+          if [[ "${head_repository}" != "${REPOSITORY}" ]]; then
+            echo "::error::PR #${PR_NUMBER} comes from '${head_repository}'. Step 9 refuses to push to fork PRs."
+            exit 1
+          fi
 
-          cp "${PLAN_PATH}" "${OUTPUT_DIR}/ai-migration-plan.json"
-          cp "${GITHUB_WORKSPACE}/.github/scripts/openrewrite-recipe-generator.py" \
-            "${OUTPUT_DIR}/analysis-tools/openrewrite-recipe-generator.py"
+          if ! git check-ref-format --branch "${head_ref}" >/dev/null 2>&1; then
+            echo "::error::Invalid PR head branch name: ${head_ref}"
+            exit 1
+          fi
 
-          {
-            echo "## Generated OpenRewrite recipe"
-            echo
-            echo "- Source Step 6 run: \`${{ steps.source.outputs.run_id }}\`"
-            echo "- Source artifact: \`${STEP6_ARTIFACT_NAME}\`"
-            echo "- Recipe: \`${recipe_name}\`"
-            echo "- Recipe steps: \`$(jq -r '.summary.generatedRecipeStepCount' "${OUTPUT_DIR}/openrewrite-recipe-manifest.json")\`"
-            echo
-            echo '```yaml'
-            cat "${OUTPUT_DIR}/rewrite.yml"
-            echo '```'
-          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "PR_HEAD_REF=${head_ref}" >> "${GITHUB_ENV}"
 
-          echo "output_dir=${OUTPUT_DIR}" >> "${GITHUB_OUTPUT}"
-          echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+      - name: Checkout exact verified PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PR_HEAD_SHA }}
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: Create checksums
+      - name: Verify clean checkout and apply exact verified patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$(git status --porcelain=v1)" ]]; then
+            echo "::error::Checkout is not clean before applying the verified patch."
+            git status --short
+            exit 1
+          fi
+
+          git apply --check --whitespace=error-all "${VERIFIED_PATCH_PATH}"
+          git apply --index --whitespace=error-all "${VERIFIED_PATCH_PATH}"
+
+          git diff --cached --check
+
+          git diff --cached --name-only | sort -u > "${RUNNER_TEMP}/applied-files.txt"
+          sort -u "${VERIFIED_CHANGED_FILES_PATH}" > "${RUNNER_TEMP}/verified-files.txt"
+
+          if ! diff -u "${RUNNER_TEMP}/verified-files.txt" "${RUNNER_TEMP}/applied-files.txt"; then
+            echo "::error::Files changed by the applied patch do not exactly match the files verified by Step 8."
+            exit 1
+          fi
+
+          applied_count="$(grep -cve '^$' "${RUNNER_TEMP}/applied-files.txt" || true)"
+          if [[ "${applied_count}" -ne "${VERIFIED_CHANGED_COUNT}" ]]; then
+            echo "::error::Applied file count (${applied_count}) does not match verified count (${VERIFIED_CHANGED_COUNT})."
+            exit 1
+          fi
+
+      - name: Create migration commit
+        id: commit
+        shell: bash
+        env:
+          STEP8_RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit \
+            -m "chore: apply generated OpenRewrite migration" \
+            -m "Verified by PR 08 run ${STEP8_RUN_ID}." \
+            -m "Verified source HEAD: ${PR_HEAD_SHA}"
+
+          commit_sha="$(git rev-parse HEAD)"
+          echo "commit_sha=${commit_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Re-check remote PR head immediately before push
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          current_head_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+
+          if [[ "${current_head_sha}" != "${PR_HEAD_SHA}" ]]; then
+            echo "::error::PR #${PR_NUMBER} moved after checkout. Expected ${PR_HEAD_SHA}, current ${current_head_sha}. Refusing to push."
+            exit 1
+          fi
+
+      - name: Push commit to PR branch
+        id: push
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git push origin "HEAD:refs/heads/${PR_HEAD_REF}"
+          echo "performed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify pushed commit is PR head
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          PUSH_PERFORMED: ${{ steps.push.outputs.performed }}
+        run: |
+          set -euo pipefail
+
+          current_head_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+
+          if [[ "${current_head_sha}" != "${COMMIT_SHA}" ]]; then
+            echo "::error::Push completed but PR #${PR_NUMBER} HEAD is ${current_head_sha}, expected ${COMMIT_SHA}."
+            exit 1
+          fi
+
+      - name: Create Step 9 audit artifact
         if: always()
         shell: bash
         env:
-          OUTPUT_DIR: ${{ runner.temp }}/step7-output
+          STEP8_RUN_ID: ${{ steps.source.outputs.run_id }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          PUSH_PERFORMED: ${{ steps.push.outputs.performed }}
         run: |
           set -euo pipefail
 
-          if [[ -d "${OUTPUT_DIR}" ]]; then
-            (
-              cd "${OUTPUT_DIR}"
-              find . -type f ! -name SHA256SUMS -print0 \
-                | sort -z \
-                | xargs -0 sha256sum \
-                > SHA256SUMS
-            )
+          output_dir="${RUNNER_TEMP}/step9-output"
+          rm -rf -- "${output_dir}"
+          mkdir -p -- "${output_dir}"
+
+          if [[ -f "${VERIFIED_PATCH_PATH:-}" ]]; then
+            cp "${VERIFIED_PATCH_PATH}" "${output_dir}/verified-rewrite.patch"
           fi
 
-      - name: Upload OpenRewrite recipe artifact
+          if [[ -f "${VERIFIED_CHANGED_FILES_PATH:-}" ]]; then
+            cp "${VERIFIED_CHANGED_FILES_PATH}" "${output_dir}/changed-files.txt"
+          fi
+
+          STEP8_RUN_ID="${STEP8_RUN_ID:-}" \
+          STEP8_ARTIFACT_NAME="${STEP8_ARTIFACT_NAME:-}" \
+          PR_NUMBER="${PR_NUMBER:-0}" \
+          PR_HEAD_SHA="${PR_HEAD_SHA:-}" \
+          PR_HEAD_REF="${PR_HEAD_REF:-}" \
+          COMMIT_SHA="${COMMIT_SHA:-}" \
+          PUSH_PERFORMED="${PUSH_PERFORMED:-false}" \
+          OUTPUT_DIR="${output_dir}" \
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+
+          def as_int(value):
+              try:
+                  return int(value)
+              except (TypeError, ValueError):
+                  return None
+
+          result = {
+              "schemaVersion": 1,
+              "sourceStep8RunId": as_int(os.environ.get("STEP8_RUN_ID")),
+              "sourceArtifact": os.environ.get("STEP8_ARTIFACT_NAME") or None,
+              "pullRequest": as_int(os.environ.get("PR_NUMBER")),
+              "verifiedHeadSha": os.environ.get("PR_HEAD_SHA") or None,
+              "prHeadRef": os.environ.get("PR_HEAD_REF") or None,
+              "commitSha": os.environ.get("COMMIT_SHA") or None,
+              "commitCreated": bool(os.environ.get("COMMIT_SHA")),
+              "pushPerformed": os.environ.get("PUSH_PERFORMED") == "true",
+          }
+
+          (output_dir / "step9-result.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          (
+            cd "${output_dir}"
+            find . -type f ! -name SHA256SUMS -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS
+          )
+
+          {
+            echo "## Verified OpenRewrite migration commit"
+            echo
+            echo "- Source Step 8 run: \`${STEP8_RUN_ID:-unknown}\`"
+            echo "- PR: \`#${PR_NUMBER:-unknown}\`"
+            echo "- Branch: \`${PR_HEAD_REF:-unknown}\`"
+            echo "- Verified HEAD: \`${PR_HEAD_SHA:-unknown}\`"
+            echo "- Commit: \`${COMMIT_SHA:-not-created}\`"
+            echo "- Push performed: \`${PUSH_PERFORMED:-false}\`"
+            echo "- Verified changed files: \`${VERIFIED_CHANGED_COUNT:-unknown}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload Step 9 audit artifact
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: pr-openrewrite-recipe-${{ steps.generate.outputs.pr_number || 'unknown' }}-${{ steps.source.outputs.run_id }}
-          path: ${{ runner.temp }}/step7-output
+          name: pr-openrewrite-commit-${{ env.PR_NUMBER || 'unknown' }}-${{ steps.source.outputs.run_id }}
+          path: ${{ runner.temp }}/step9-output
           if-no-files-found: warn
           retention-days: 14

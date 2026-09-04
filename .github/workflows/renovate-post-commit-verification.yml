@@ -1,0 +1,368 @@
+name: PR 10 - Verify pushed OpenRewrite migration
+
+on:
+  workflow_run:
+    workflows:
+      - PR 09 - Commit verified OpenRewrite migration
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      step9_run_id:
+        description: GitHub Actions run ID of a successful PR 09 run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-pushed-commit:
+    name: Verify pushed migration commit
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    env:
+      JAVA_VERSION: "17"
+
+    steps:
+      - name: Resolve and verify Step 9 run
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          AUTO_RUN_ID: ${{ github.event.workflow_run.id }}
+          MANUAL_RUN_ID: ${{ inputs.step9_run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            run_id="${MANUAL_RUN_ID}"
+          else
+            run_id="${AUTO_RUN_ID}"
+          fi
+
+          if [[ ! "${run_id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid Step 9 run ID: ${run_id}"
+            exit 1
+          fi
+
+          run_json="$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}")"
+          run_name="$(jq -r '.name' <<<"${run_json}")"
+          conclusion="$(jq -r '.conclusion' <<<"${run_json}")"
+          run_repository="$(jq -r '.repository.full_name' <<<"${run_json}")"
+
+          if [[ "${run_repository}" != "${REPOSITORY}" ]]; then
+            echo "::error::Step 9 run belongs to '${run_repository}', not '${REPOSITORY}'."
+            exit 1
+          fi
+
+          if [[ "${run_name}" != "PR 09 - Commit verified OpenRewrite migration" ]]; then
+            echo "::error::Run ${run_id} belongs to '${run_name}', not PR 09."
+            exit 1
+          fi
+
+          if [[ "${conclusion}" != "success" ]]; then
+            echo "::error::Step 9 run ${run_id} conclusion is '${conclusion}', expected 'success'."
+            exit 1
+          fi
+
+          echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download and verify Step 9 audit artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          input_dir="${RUNNER_TEMP}/step9-input"
+          rm -rf -- "${input_dir}"
+          mkdir -p -- "${input_dir}"
+
+          mapfile -t artifact_names < <(
+            gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+              --paginate \
+              --jq '.artifacts[] | select(.expired == false) | .name' \
+              | grep '^pr-openrewrite-commit-' || true
+          )
+
+          if [[ "${#artifact_names[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one non-expired pr-openrewrite-commit-* artifact, found ${#artifact_names[@]}."
+            printf 'Found artifact: %s\n' "${artifact_names[@]:-none}"
+            exit 1
+          fi
+
+          artifact_name="${artifact_names[0]}"
+
+          gh run download "${RUN_ID}" \
+            --repo "${REPOSITORY}" \
+            --name "${artifact_name}" \
+            --dir "${input_dir}"
+
+          result_path="$(find "${input_dir}" -type f -name step9-result.json -print -quit)"
+          checksum_path="$(find "${input_dir}" -type f -name SHA256SUMS -print -quit)"
+
+          if [[ -z "${result_path}" || ! -f "${result_path}" ]]; then
+            echo "::error::Step 9 artifact is missing step9-result.json."
+            exit 1
+          fi
+
+          if [[ -z "${checksum_path}" || ! -f "${checksum_path}" ]]; then
+            echo "::error::Step 9 artifact is missing SHA256SUMS."
+            exit 1
+          fi
+
+          checksum_dir="$(dirname "${checksum_path}")"
+          (cd "${checksum_dir}" && sha256sum --check --strict SHA256SUMS)
+
+          commit_created="$(jq -r '.commitCreated' "${result_path}")"
+          push_performed="$(jq -r '.pushPerformed' "${result_path}")"
+          pr_number="$(jq -r '.pullRequest // empty' "${result_path}")"
+          verified_head_sha="$(jq -r '.verifiedHeadSha // empty' "${result_path}")"
+          commit_sha="$(jq -r '.commitSha // empty' "${result_path}")"
+          pr_head_ref="$(jq -r '.prHeadRef // empty' "${result_path}")"
+
+          if [[ "${commit_created}" != "true" || "${push_performed}" != "true" ]]; then
+            echo "::error::Step 9 did not report both a created commit and a successful push."
+            exit 1
+          fi
+
+          if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid pullRequest in step9-result.json: ${pr_number}"
+            exit 1
+          fi
+
+          if [[ ! "${verified_head_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid verifiedHeadSha: ${verified_head_sha}"
+            exit 1
+          fi
+
+          if [[ ! "${commit_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid commitSha: ${commit_sha}"
+            exit 1
+          fi
+
+          if ! git check-ref-format --branch "${pr_head_ref}" >/dev/null 2>&1; then
+            echo "::error::Invalid PR head branch name: ${pr_head_ref}"
+            exit 1
+          fi
+
+          echo "STEP9_ARTIFACT_NAME=${artifact_name}" >> "${GITHUB_ENV}"
+          echo "PR_NUMBER=${pr_number}" >> "${GITHUB_ENV}"
+          echo "PRE_MIGRATION_HEAD_SHA=${verified_head_sha}" >> "${GITHUB_ENV}"
+          echo "PUSHED_COMMIT_SHA=${commit_sha}" >> "${GITHUB_ENV}"
+          echo "PR_HEAD_REF=${pr_head_ref}" >> "${GITHUB_ENV}"
+
+      - name: Verify PR points to pushed migration commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          state="$(jq -r '.state' <<<"${pr_json}")"
+          current_head_sha="$(jq -r '.head.sha' <<<"${pr_json}")"
+          current_head_ref="$(jq -r '.head.ref' <<<"${pr_json}")"
+          head_repository="$(jq -r '.head.repo.full_name // empty' <<<"${pr_json}")"
+
+          if [[ "${state}" != "open" ]]; then
+            echo "::error::PR #${PR_NUMBER} is '${state}', expected 'open'."
+            exit 1
+          fi
+
+          if [[ "${head_repository}" != "${REPOSITORY}" ]]; then
+            echo "::error::PR #${PR_NUMBER} now points to repository '${head_repository}'."
+            exit 1
+          fi
+
+          if [[ "${current_head_ref}" != "${PR_HEAD_REF}" ]]; then
+            echo "::error::PR branch changed from '${PR_HEAD_REF}' to '${current_head_ref}'."
+            exit 1
+          fi
+
+          if [[ "${current_head_sha}" != "${PUSHED_COMMIT_SHA}" ]]; then
+            echo "::error::PR #${PR_NUMBER} HEAD is ${current_head_sha}, expected pushed migration commit ${PUSHED_COMMIT_SHA}."
+            exit 1
+          fi
+
+      - name: Checkout exact pushed migration commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PUSHED_COMMIT_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Verify commit ancestry and clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          actual_head="$(git rev-parse HEAD)"
+          if [[ "${actual_head}" != "${PUSHED_COMMIT_SHA}" ]]; then
+            echo "::error::Checked out ${actual_head}, expected ${PUSHED_COMMIT_SHA}."
+            exit 1
+          fi
+
+          parent_sha="$(git rev-parse HEAD^)"
+          if [[ "${parent_sha}" != "${PRE_MIGRATION_HEAD_SHA}" ]]; then
+            echo "::error::Migration commit parent is ${parent_sha}, expected verified pre-migration HEAD ${PRE_MIGRATION_HEAD_SHA}."
+            exit 1
+          fi
+
+          if [[ -n "$(git status --porcelain=v1)" ]]; then
+            echo "::error::Checkout is not clean before post-commit verification."
+            git status --short
+            exit 1
+          fi
+
+      - name: Run Maven tests on pushed commit
+        id: test
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          output_dir="${RUNNER_TEMP}/step10-output"
+          mkdir -p -- "${output_dir}"
+
+          chmod +x ./mvnw
+
+          set +e
+          ./mvnw -B -ntp test 2>&1 | tee "${output_dir}/maven-test.log"
+          test_exit_code="${PIPESTATUS[0]}"
+          set -e
+
+          printf '%s\n' "${test_exit_code}" > "${output_dir}/maven-test-exit-code.txt"
+          echo "exit_code=${test_exit_code}" >> "${GITHUB_OUTPUT}"
+
+          tracked_changes="$(git status --porcelain=v1 --untracked-files=no)"
+          printf '%s\n' "${tracked_changes}" > "${output_dir}/tracked-changes-after-test.txt"
+
+          if [[ -n "${tracked_changes}" ]]; then
+            echo "tracked_changes=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "tracked_changes=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create Step 10 verification result
+        if: always()
+        shell: bash
+        env:
+          STEP9_RUN_ID: ${{ steps.source.outputs.run_id }}
+          TEST_EXIT_CODE: ${{ steps.test.outputs.exit_code }}
+          TRACKED_CHANGES: ${{ steps.test.outputs.tracked_changes }}
+        run: |
+          set -euo pipefail
+
+          output_dir="${RUNNER_TEMP}/step10-output"
+          mkdir -p -- "${output_dir}"
+
+          STEP9_RUN_ID="${STEP9_RUN_ID:-}" \
+          STEP9_ARTIFACT_NAME="${STEP9_ARTIFACT_NAME:-}" \
+          PR_NUMBER="${PR_NUMBER:-0}" \
+          PR_HEAD_REF="${PR_HEAD_REF:-}" \
+          PRE_MIGRATION_HEAD_SHA="${PRE_MIGRATION_HEAD_SHA:-}" \
+          PUSHED_COMMIT_SHA="${PUSHED_COMMIT_SHA:-}" \
+          TEST_EXIT_CODE="${TEST_EXIT_CODE:-}" \
+          TRACKED_CHANGES="${TRACKED_CHANGES:-}" \
+          OUTPUT_DIR="${output_dir}" \
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+
+          def as_int(value):
+              try:
+                  return int(value)
+              except (TypeError, ValueError):
+                  return None
+
+          test_exit_code = as_int(os.environ.get("TEST_EXIT_CODE"))
+          tracked_changes = os.environ.get("TRACKED_CHANGES") == "true"
+
+          result = {
+              "schemaVersion": 1,
+              "sourceStep9RunId": as_int(os.environ.get("STEP9_RUN_ID")),
+              "sourceArtifact": os.environ.get("STEP9_ARTIFACT_NAME") or None,
+              "pullRequest": as_int(os.environ.get("PR_NUMBER")),
+              "prHeadRef": os.environ.get("PR_HEAD_REF") or None,
+              "preMigrationHeadSha": os.environ.get("PRE_MIGRATION_HEAD_SHA") or None,
+              "pushedCommitSha": os.environ.get("PUSHED_COMMIT_SHA") or None,
+              "mavenTestExitCode": test_exit_code,
+              "trackedChangesAfterTest": tracked_changes,
+              "successful": test_exit_code == 0 and not tracked_changes,
+          }
+
+          (output_dir / "step10-result.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          (
+            cd "${output_dir}"
+            find . -type f ! -name SHA256SUMS -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS
+          )
+
+          successful="$(jq -r '.successful' "${output_dir}/step10-result.json")"
+
+          {
+            echo "## Post-commit migration verification"
+            echo
+            echo "- Source Step 9 run: \`${STEP9_RUN_ID:-unknown}\`"
+            echo "- PR: \`#${PR_NUMBER:-unknown}\`"
+            echo "- Branch: \`${PR_HEAD_REF:-unknown}\`"
+            echo "- Pushed commit: \`${PUSHED_COMMIT_SHA:-unknown}\`"
+            echo "- Maven test exit code: \`${TEST_EXIT_CODE:-unknown}\`"
+            echo "- Tracked changes after test: \`${TRACKED_CHANGES:-unknown}\`"
+            echo "- Verification successful: \`${successful}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload Step 10 verification artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pr-openrewrite-post-commit-${{ env.PR_NUMBER || 'unknown' }}-${{ steps.source.outputs.run_id }}
+          path: ${{ runner.temp }}/step10-output
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce post-commit verification
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          result_path="${RUNNER_TEMP}/step10-output/step10-result.json"
+
+          if [[ ! -f "${result_path}" ]]; then
+            echo "::error::Post-commit verification result was not created."
+            exit 1
+          fi
+
+          if [[ "$(jq -r '.successful' "${result_path}")" != "true" ]]; then
+            echo "::error::Pushed OpenRewrite migration failed post-commit verification. See artifact for logs."
+            exit 1
+          fi
