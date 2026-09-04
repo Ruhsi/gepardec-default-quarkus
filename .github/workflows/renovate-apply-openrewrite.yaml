@@ -223,7 +223,7 @@ jobs:
           "${MAVEN_CMD}" \
             -B \
             -ntp \
-            "org.openrewrite.maven:rewrite-maven-plugin:${REWRITE_MAVEN_PLUGIN_VERSION}:run" \
+            "org.openrewrite.maven:rewrite-maven-plugin:${REWRITE_MAVEN_PLUGIN_VERSION}:runNoFork" \
             "-Drewrite.configLocation=${RECIPE_PATH}" \
             "-Drewrite.activeRecipes=${RECIPE_NAME}" \
             -Drewrite.exportDatatables=false \
