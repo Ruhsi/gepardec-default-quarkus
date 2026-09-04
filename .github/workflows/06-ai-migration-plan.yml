@@ -215,7 +215,7 @@ jobs:
           echo "impact_count=${impact_count}" >> "${GITHUB_OUTPUT}"
           echo "needs_ai=${needs_ai}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build Groq Structured Outputs request
+      - name: Request batched AI migration plan
         if: steps.build.outputs.needs_ai == 'true'
         shell: bash
         env:
@@ -223,8 +223,16 @@ jobs:
           MODEL: ${{ env.GROQ_MODEL }}
           REASONING_EFFORT: ${{ env.AI_REASONING_EFFORT }}
           MAX_OUTPUT_TOKENS: ${{ env.AI_MAX_OUTPUT_TOKENS }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          BATCH_SIZE: "4"
+          MAX_RATE_LIMIT_RETRIES: "8"
         run: |
           set -euo pipefail
+
+          if [[ -z "${GROQ_API_KEY:-}" ]]; then
+            echo "::error::Repository secret GROQ_API_KEY is not configured."
+            exit 1
+          fi
 
           python3 <<'PY'
           import json
@@ -235,108 +243,196 @@ jobs:
           evidence = json.loads((out / "ai-migration-input.json").read_text(encoding="utf-8"))
           schema = json.loads((out / "ai-migration-output-schema.json").read_text(encoding="utf-8"))
           instructions = (out / "ai-migration-instructions.txt").read_text(encoding="utf-8").strip()
+          batch_size = int(os.environ["BATCH_SIZE"])
 
-          request = {
-              "model": os.environ["MODEL"],
-              "store": False,
-              "reasoning": {
-                  "effort": os.environ["REASONING_EFFORT"]
-              },
-              "max_output_tokens": int(os.environ["MAX_OUTPUT_TOKENS"]),
-              "input": [
-                  {
-                      "role": "developer",
-                      "content": [
-                          {
-                              "type": "input_text",
-                              "text": instructions,
-                          }
-                      ],
-                  },
-                  {
-                      "role": "user",
-                      "content": [
-                          {
-                              "type": "input_text",
-                              "text": "Migration evidence JSON follows. Use only this data.\n" + json.dumps(evidence, sort_keys=True),
-                          }
-                      ],
-                  },
-              ],
-              "text": {
-                  "format": {
-                      "type": "json_schema",
-                      "name": "dependency_migration_plan",
-                      "strict": True,
-                      "schema": schema,
-                  }
-              },
+          impacts = evidence.get("impacts", [])
+          batch_dir = out / "groq-batches"
+          batch_dir.mkdir(parents=True, exist_ok=True)
+
+          manifest = {
+              "batchSize": batch_size,
+              "impactCount": len(impacts),
+              "batchCount": 0,
+              "batches": [],
           }
 
-          (out / "groq-request.json").write_text(
-              json.dumps(request, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
+          for index, offset in enumerate(range(0, len(impacts), batch_size), start=1):
+              batch_impacts = impacts[offset:offset + batch_size]
+              batch_evidence = dict(evidence)
+              batch_evidence["impactCount"] = len(batch_impacts)
+              batch_evidence["impacts"] = batch_impacts
+
+              request = {
+                  "model": os.environ["MODEL"],
+                  "store": False,
+                  "reasoning": {"effort": os.environ["REASONING_EFFORT"]},
+                  "max_output_tokens": int(os.environ["MAX_OUTPUT_TOKENS"]),
+                  "input": [
+                      {
+                          "role": "developer",
+                          "content": [{"type": "input_text", "text": instructions}],
+                      },
+                      {
+                          "role": "user",
+                          "content": [{
+                              "type": "input_text",
+                              "text": "Migration evidence JSON follows. Use only this data.\n"
+                                      + json.dumps(batch_evidence, sort_keys=True),
+                          }],
+                      },
+                  ],
+                  "text": {
+                      "format": {
+                          "type": "json_schema",
+                          "name": "dependency_migration_plan",
+                          "strict": True,
+                          "schema": schema,
+                      }
+                  },
+              }
+
+              stem = f"batch-{index:03d}"
+              request_path = batch_dir / f"{stem}-request.json"
+              request_path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              manifest["batches"].append({
+                  "batch": index,
+                  "request": str(request_path.relative_to(out)),
+                  "impactIds": [i["impactId"] for i in batch_impacts],
+              })
+
+          manifest["batchCount"] = len(manifest["batches"])
+          (out / "groq-batch-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           PY
 
-      - name: Request AI migration plan
-        if: steps.build.outputs.needs_ai == 'true'
-        shell: bash
-        env:
-          OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: |
-          set -euo pipefail
+          batch_count="$(jq -r '.batchCount' "${OUTPUT_DIR}/groq-batch-manifest.json")"
+          mkdir -p "${OUTPUT_DIR}/groq-batches"
 
-          if [[ -z "${GROQ_API_KEY:-}" ]]; then
-            echo "::error::Repository secret GROQ_API_KEY is not configured."
-            exit 1
-          fi
+          for batch in $(seq 1 "${batch_count}"); do
+            stem="$(printf 'batch-%03d' "${batch}")"
+            request_file="${OUTPUT_DIR}/groq-batches/${stem}-request.json"
+            response_file="${OUTPUT_DIR}/groq-batches/${stem}-response.json"
+            headers_file="${OUTPUT_DIR}/groq-batches/${stem}-headers.txt"
+            raw_file="${OUTPUT_DIR}/groq-batches/${stem}-raw-plan.json"
 
-          http_code="$(curl \
-            --silent \
-            --show-error \
-            --connect-timeout 20 \
-            --max-time 300 \
-            --retry 2 \
-            --retry-all-errors \
-            --output "${OUTPUT_DIR}/groq-response.json" \
-            --write-out '%{http_code}' \
-            --request POST \
-            --header "Authorization: Bearer ${GROQ_API_KEY}" \
-            --header 'Content-Type: application/json' \
-            --data-binary "@${OUTPUT_DIR}/groq-request.json" \
-            https://api.groq.com/openai/v1/responses)"
+            attempt=1
+            while true; do
+              : > "${headers_file}"
+              http_code="$(curl \
+                --silent \
+                --show-error \
+                --connect-timeout 20 \
+                --max-time 300 \
+                --output "${response_file}" \
+                --dump-header "${headers_file}" \
+                --write-out '%{http_code}' \
+                --request POST \
+                --header "Authorization: Bearer ${GROQ_API_KEY}" \
+                --header 'Content-Type: application/json' \
+                --data-binary "@${request_file}" \
+                https://api.groq.com/openai/v1/responses)"
 
-          if [[ "${http_code}" != "200" ]]; then
-            error_message="$(jq -r '.error.message // .error // "unknown Groq API error"' "${OUTPUT_DIR}/groq-response.json" 2>/dev/null || true)"
-            echo "::error::Groq Responses API returned HTTP ${http_code}: ${error_message}"
-            exit 1
-          fi
+              if [[ "${http_code}" == "200" ]]; then
+                break
+              fi
 
-          status="$(jq -r '.status // ""' "${OUTPUT_DIR}/groq-response.json")"
-          if [[ "${status}" != "completed" ]]; then
-            echo "::error::Groq response did not complete successfully. status=${status}"
-            jq '{id,status,error,incomplete_details}' "${OUTPUT_DIR}/groq-response.json" || true
-            exit 1
-          fi
+              error_message="$(jq -r '.error.message // .error // "unknown Groq API error"' "${response_file}" 2>/dev/null || true)"
 
-          jq -r '[
-            .output[]?
-            | select(.type == "message")
-            | .content[]?
-            | select(.type == "output_text")
-            | .text
-          ] | join("")' \
-            "${OUTPUT_DIR}/groq-response.json" \
-            > "${OUTPUT_DIR}/ai-migration-plan-raw.json"
+              if [[ "${http_code}" == "429" && "${attempt}" -le "${MAX_RATE_LIMIT_RETRIES}" ]]; then
+                retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\\r", "", $2); print $2}' "${headers_file}" | tail -1)"
+                if [[ ! "${retry_after}" =~ ^[0-9]+$ ]]; then
+                  retry_after=15
+                fi
+                echo "Groq rate limit for ${stem}; retrying in ${retry_after}s (attempt ${attempt}/${MAX_RATE_LIMIT_RETRIES})."
+                sleep "${retry_after}"
+                attempt=$((attempt + 1))
+                continue
+              fi
 
-          if [[ ! -s "${OUTPUT_DIR}/ai-migration-plan-raw.json" ]]; then
-            echo "::error::Groq response contained no structured output text."
-            exit 1
-          fi
+              if [[ "${http_code}" == "413" ]]; then
+                echo "::error::Groq rejected ${stem} as too large even with BATCH_SIZE=${BATCH_SIZE}: ${error_message}"
+              else
+                echo "::error::Groq Responses API returned HTTP ${http_code} for ${stem}: ${error_message}"
+              fi
+              exit 1
+            done
 
-          jq -e . "${OUTPUT_DIR}/ai-migration-plan-raw.json" >/dev/null
+            status="$(jq -r '.status // ""' "${response_file}")"
+            if [[ "${status}" != "completed" ]]; then
+              echo "::error::Groq response for ${stem} did not complete successfully. status=${status}"
+              jq '{id,status,error,incomplete_details}' "${response_file}" || true
+              exit 1
+            fi
+
+            jq -r '[
+              .output[]?
+              | select(.type == "message")
+              | .content[]?
+              | select(.type == "output_text")
+              | .text
+            ] | join("")' "${response_file}" > "${raw_file}"
+
+            if [[ ! -s "${raw_file}" ]]; then
+              echo "::error::Groq response for ${stem} contained no structured output text."
+              exit 1
+            fi
+            jq -e . "${raw_file}" >/dev/null
+          done
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ["OUTPUT_DIR"])
+          manifest = json.loads((out / "groq-batch-manifest.json").read_text(encoding="utf-8"))
+          decisions = []
+          summaries = []
+          responses = []
+          usage_totals = {}
+
+          for entry in manifest["batches"]:
+              stem = f"batch-{entry['batch']:03d}"
+              raw = json.loads((out / "groq-batches" / f"{stem}-raw-plan.json").read_text(encoding="utf-8"))
+              response = json.loads((out / "groq-batches" / f"{stem}-response.json").read_text(encoding="utf-8"))
+              batch_decisions = raw.get("decisions", [])
+              decisions.extend(batch_decisions)
+              if raw.get("summary"):
+                  summaries.append(raw["summary"])
+              usage = response.get("usage") or {}
+              for key, value in usage.items():
+                  if isinstance(value, int):
+                      usage_totals[key] = usage_totals.get(key, 0) + value
+              responses.append({
+                  "batch": entry["batch"],
+                  "responseId": response.get("id"),
+                  "model": response.get("model"),
+                  "status": response.get("status"),
+                  "usage": usage,
+              })
+
+          combined = {
+              "summary": " | ".join(summaries),
+              "decisions": decisions,
+          }
+          (out / "ai-migration-plan-raw.json").write_text(
+              json.dumps(combined, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          metadata = {
+              "provider": "Groq",
+              "endpoint": "Responses API",
+              "model": os.environ["MODEL"],
+              "store": False,
+              "batchSize": int(os.environ["BATCH_SIZE"]),
+              "batchCount": manifest["batchCount"],
+              "responses": responses,
+              "usageTotals": usage_totals,
+          }
+          (out / "ai-provider-metadata.json").write_text(
+              json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
 
       - name: Validate and enrich AI migration plan
         if: steps.build.outputs.needs_ai == 'true'
@@ -351,28 +447,6 @@ jobs:
             --input "${OUTPUT_DIR}/ai-migration-input.json" \
             --raw-plan "${OUTPUT_DIR}/ai-migration-plan-raw.json" \
             --output-dir "${OUTPUT_DIR}"
-
-          python3 <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          out = Path(os.environ["OUTPUT_DIR"])
-          response = json.loads((out / "groq-response.json").read_text(encoding="utf-8"))
-          metadata = {
-              "provider": "Groq",
-              "endpoint": "Responses API",
-              "responseId": response.get("id"),
-              "model": response.get("model"),
-              "status": response.get("status"),
-              "store": False,
-              "usage": response.get("usage"),
-          }
-          (out / "ai-provider-metadata.json").write_text(
-              json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          PY
 
       - name: Create deterministic empty plan when no source impacts exist
         if: steps.build.outputs.needs_ai == 'false'
