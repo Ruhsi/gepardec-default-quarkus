@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  OPENAI_MODEL: gpt-5.4-mini-2026-03-17
+  GROQ_MODEL: openai/gpt-oss-120b
   AI_REASONING_EFFORT: medium
   AI_MAX_OUTPUT_TOKENS: "12000"
 
@@ -215,12 +215,12 @@ jobs:
           echo "impact_count=${impact_count}" >> "${GITHUB_OUTPUT}"
           echo "needs_ai=${needs_ai}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build OpenAI Structured Outputs request
+      - name: Build Groq Structured Outputs request
         if: steps.build.outputs.needs_ai == 'true'
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
-          MODEL: ${{ env.OPENAI_MODEL }}
+          MODEL: ${{ env.GROQ_MODEL }}
           REASONING_EFFORT: ${{ env.AI_REASONING_EFFORT }}
           MAX_OUTPUT_TOKENS: ${{ env.AI_MAX_OUTPUT_TOKENS }}
         run: |
@@ -273,7 +273,7 @@ jobs:
               },
           }
 
-          (out / "openai-request.json").write_text(
+          (out / "groq-request.json").write_text(
               json.dumps(request, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
@@ -284,12 +284,12 @@ jobs:
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-            echo "::error::Repository secret OPENAI_API_KEY is not configured."
+          if [[ -z "${GROQ_API_KEY:-}" ]]; then
+            echo "::error::Repository secret GROQ_API_KEY is not configured."
             exit 1
           fi
 
@@ -300,24 +300,24 @@ jobs:
             --max-time 300 \
             --retry 2 \
             --retry-all-errors \
-            --output "${OUTPUT_DIR}/openai-response.json" \
+            --output "${OUTPUT_DIR}/groq-response.json" \
             --write-out '%{http_code}' \
             --request POST \
-            --header "Authorization: Bearer ${OPENAI_API_KEY}" \
+            --header "Authorization: Bearer ${GROQ_API_KEY}" \
             --header 'Content-Type: application/json' \
-            --data-binary "@${OUTPUT_DIR}/openai-request.json" \
-            https://api.openai.com/v1/responses)"
+            --data-binary "@${OUTPUT_DIR}/groq-request.json" \
+            https://api.groq.com/openai/v1/responses)"
 
           if [[ "${http_code}" != "200" ]]; then
-            error_message="$(jq -r '.error.message // .error // "unknown OpenAI API error"' "${OUTPUT_DIR}/openai-response.json" 2>/dev/null || true)"
-            echo "::error::OpenAI Responses API returned HTTP ${http_code}: ${error_message}"
+            error_message="$(jq -r '.error.message // .error // "unknown Groq API error"' "${OUTPUT_DIR}/groq-response.json" 2>/dev/null || true)"
+            echo "::error::Groq Responses API returned HTTP ${http_code}: ${error_message}"
             exit 1
           fi
 
-          status="$(jq -r '.status // ""' "${OUTPUT_DIR}/openai-response.json")"
+          status="$(jq -r '.status // ""' "${OUTPUT_DIR}/groq-response.json")"
           if [[ "${status}" != "completed" ]]; then
-            echo "::error::OpenAI response did not complete successfully. status=${status}"
-            jq '{id,status,error,incomplete_details}' "${OUTPUT_DIR}/openai-response.json" || true
+            echo "::error::Groq response did not complete successfully. status=${status}"
+            jq '{id,status,error,incomplete_details}' "${OUTPUT_DIR}/groq-response.json" || true
             exit 1
           fi
 
@@ -328,11 +328,11 @@ jobs:
             | select(.type == "output_text")
             | .text
           ] | join("")' \
-            "${OUTPUT_DIR}/openai-response.json" \
+            "${OUTPUT_DIR}/groq-response.json" \
             > "${OUTPUT_DIR}/ai-migration-plan-raw.json"
 
           if [[ ! -s "${OUTPUT_DIR}/ai-migration-plan-raw.json" ]]; then
-            echo "::error::OpenAI response contained no structured output text."
+            echo "::error::Groq response contained no structured output text."
             exit 1
           fi
 
@@ -358,9 +358,9 @@ jobs:
           from pathlib import Path
 
           out = Path(os.environ["OUTPUT_DIR"])
-          response = json.loads((out / "openai-response.json").read_text(encoding="utf-8"))
+          response = json.loads((out / "groq-response.json").read_text(encoding="utf-8"))
           metadata = {
-              "provider": "OpenAI",
+              "provider": "Groq",
               "endpoint": "Responses API",
               "responseId": response.get("id"),
               "model": response.get("model"),
@@ -392,7 +392,7 @@ jobs:
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
-          MODEL: ${{ env.OPENAI_MODEL }}
+          MODEL: ${{ env.GROQ_MODEL }}
         run: |
           set -euo pipefail
 
