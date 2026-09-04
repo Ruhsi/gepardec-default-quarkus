@@ -1,0 +1,440 @@
+name: PR 08 - Apply OpenRewrite migration
+
+on:
+  workflow_run:
+    workflows:
+      - PR 07 - Generate OpenRewrite recipe
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      step7_run_id:
+        description: GitHub Actions run ID of a successful PR 07 - Generate OpenRewrite recipe run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  apply-and-verify:
+    name: Apply recipe and verify build
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    env:
+      JAVA_VERSION: "17"
+      REWRITE_MAVEN_PLUGIN_VERSION: "6.46.1"
+
+    steps:
+      - name: Resolve Step 7 run
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          AUTO_RUN_ID: ${{ github.event.workflow_run.id }}
+          MANUAL_RUN_ID: ${{ inputs.step7_run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            run_id="${MANUAL_RUN_ID}"
+          else
+            run_id="${AUTO_RUN_ID}"
+          fi
+
+          if [[ ! "${run_id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid Step 7 run ID: ${run_id}"
+            exit 1
+          fi
+
+          run_json="$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}")"
+          run_name="$(jq -r '.name' <<<"${run_json}")"
+          conclusion="$(jq -r '.conclusion' <<<"${run_json}")"
+
+          if [[ "${run_name}" != "PR 07 - Generate OpenRewrite recipe" ]]; then
+            echo "::error::Run ${run_id} belongs to '${run_name}', not 'PR 07 - Generate OpenRewrite recipe'."
+            exit 1
+          fi
+
+          if [[ "${conclusion}" != "success" ]]; then
+            echo "::error::Step 7 run ${run_id} conclusion is '${conclusion}', expected 'success'."
+            exit 1
+          fi
+
+          echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download Step 7 artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          input_dir="${RUNNER_TEMP}/step7-input"
+          rm -rf -- "${input_dir}"
+          mkdir -p -- "${input_dir}"
+
+          artifact_name="$(
+            gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+              --jq '.artifacts[] | select(.expired == false) | .name' \
+              | grep '^pr-openrewrite-recipe-' \
+              | head -n 1
+          )"
+
+          if [[ -z "${artifact_name}" ]]; then
+            echo "::error::No non-expired pr-openrewrite-recipe-* artifact found on Step 7 run ${RUN_ID}."
+            exit 1
+          fi
+
+          gh run download "${RUN_ID}" \
+            --repo "${REPOSITORY}" \
+            --name "${artifact_name}" \
+            --dir "${input_dir}"
+
+          recipe_path="$(find "${input_dir}" -type f -name rewrite.yml -print -quit)"
+          manifest_path="$(find "${input_dir}" -type f -name openrewrite-recipe-manifest.json -print -quit)"
+          plan_path="$(find "${input_dir}" -type f -name ai-migration-plan.json -print -quit)"
+
+          for path in "${recipe_path}" "${manifest_path}" "${plan_path}"; do
+            if [[ -z "${path}" || ! -s "${path}" ]]; then
+              echo "::error::Step 7 artifact is incomplete."
+              exit 1
+            fi
+          done
+
+          checksum_file="$(find "${input_dir}" -type f -name SHA256SUMS -print -quit)"
+          if [[ -n "${checksum_file}" ]]; then
+            checksum_dir="$(dirname "${checksum_file}")"
+            (cd "${checksum_dir}" && sha256sum --check --strict SHA256SUMS)
+          fi
+
+          pr_number="$(jq -r '.pullRequest // empty' "${plan_path}")"
+          head_sha="$(jq -r '.headSha // empty' "${plan_path}")"
+          repository="$(jq -r '.repository // empty' "${plan_path}")"
+          recipe_name="$(jq -r '.output.recipeName // .recipe.name // .recipeName // empty' "${manifest_path}")"
+
+          if [[ -z "${recipe_name}" ]]; then
+            recipe_name="$(sed -n 's/^name:[[:space:]]*//p' "${recipe_path}" | head -n 1 | tr -d '"')"
+          fi
+
+          if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid pullRequest in ai-migration-plan.json: ${pr_number}"
+            exit 1
+          fi
+
+          if [[ ! "${head_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid headSha in ai-migration-plan.json: ${head_sha}"
+            exit 1
+          fi
+
+          if [[ "${repository}" != "${REPOSITORY}" ]]; then
+            echo "::error::Artifact repository '${repository}' does not match '${REPOSITORY}'."
+            exit 1
+          fi
+
+          if [[ -z "${recipe_name}" ]]; then
+            echo "::error::Could not determine generated recipe name."
+            exit 1
+          fi
+
+          echo "STEP7_INPUT_DIR=${input_dir}" >> "${GITHUB_ENV}"
+          echo "STEP7_ARTIFACT_NAME=${artifact_name}" >> "${GITHUB_ENV}"
+          echo "RECIPE_PATH=${recipe_path}" >> "${GITHUB_ENV}"
+          echo "RECIPE_MANIFEST_PATH=${manifest_path}" >> "${GITHUB_ENV}"
+          echo "PLAN_PATH=${plan_path}" >> "${GITHUB_ENV}"
+          echo "PR_NUMBER=${pr_number}" >> "${GITHUB_ENV}"
+          echo "PR_HEAD_SHA=${head_sha}" >> "${GITHUB_ENV}"
+          echo "RECIPE_NAME=${recipe_name}" >> "${GITHUB_ENV}"
+
+      - name: Verify PR head still belongs to PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          current_head_sha="$(jq -r '.head.sha' <<<"${pr_json}")"
+
+          if [[ "${current_head_sha}" != "${PR_HEAD_SHA}" ]]; then
+            echo "::error::PR #${PR_NUMBER} moved since Step 6/7. Analyzed HEAD=${PR_HEAD_SHA}, current HEAD=${current_head_sha}. Re-run Steps 5-7 first."
+            exit 1
+          fi
+
+      - name: Checkout exact analyzed PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PR_HEAD_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Prepare Maven command
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f ./mvnw ]]; then
+            chmod +x ./mvnw
+            echo "MAVEN_CMD=./mvnw" >> "${GITHUB_ENV}"
+          else
+            echo "MAVEN_CMD=mvn" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Snapshot workspace before rewrite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          output_dir="${RUNNER_TEMP}/step8-output"
+          rm -rf -- "${output_dir}"
+          mkdir -p -- "${output_dir}"
+
+          git status --porcelain=v1 > "${output_dir}/git-status-before.txt"
+          git rev-parse HEAD > "${output_dir}/pr-head-sha.txt"
+          cp "${RECIPE_PATH}" "${output_dir}/rewrite.yml"
+          cp "${RECIPE_MANIFEST_PATH}" "${output_dir}/openrewrite-recipe-manifest.json"
+          cp "${PLAN_PATH}" "${output_dir}/ai-migration-plan.json"
+
+          echo "OUTPUT_DIR=${output_dir}" >> "${GITHUB_ENV}"
+
+      - name: Apply generated OpenRewrite recipe
+        id: rewrite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set +e
+          "${MAVEN_CMD}" \
+            -B \
+            -ntp \
+            "org.openrewrite.maven:rewrite-maven-plugin:${REWRITE_MAVEN_PLUGIN_VERSION}:run" \
+            "-Drewrite.configLocation=${RECIPE_PATH}" \
+            "-Drewrite.activeRecipes=${RECIPE_NAME}" \
+            -Drewrite.exportDatatables=false \
+            > "${OUTPUT_DIR}/openrewrite.log" 2>&1
+          rewrite_exit=$?
+          set -e
+
+          cat "${OUTPUT_DIR}/openrewrite.log"
+
+          printf '%s\n' "${rewrite_exit}" > "${OUTPUT_DIR}/openrewrite-exit-code.txt"
+          echo "exit_code=${rewrite_exit}" >> "${GITHUB_OUTPUT}"
+
+          git status --porcelain=v1 > "${OUTPUT_DIR}/git-status-after-rewrite.txt"
+          git diff --no-ext-diff --binary > "${OUTPUT_DIR}/rewrite.patch"
+          git diff --name-only --no-ext-diff | sort -u > "${OUTPUT_DIR}/changed-files.txt"
+          git diff --stat --no-ext-diff > "${OUTPUT_DIR}/rewrite-diff-stat.txt"
+
+          if [[ "${rewrite_exit}" -ne 0 ]]; then
+            echo "::error::OpenRewrite execution failed with exit code ${rewrite_exit}."
+          fi
+
+      - name: Validate generated diff
+        id: diff
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "${OUTPUT_DIR}/changed-files.txt" ]]; then
+            : > "${OUTPUT_DIR}/changed-files.txt"
+          fi
+
+          changed_count="$(grep -cve '^$' "${OUTPUT_DIR}/changed-files.txt" || true)"
+          echo "changed_count=${changed_count}" >> "${GITHUB_OUTPUT}"
+
+          set +e
+          git diff --check > "${OUTPUT_DIR}/git-diff-check.txt" 2>&1
+          diff_check_exit=$?
+          set -e
+
+          printf '%s\n' "${diff_check_exit}" > "${OUTPUT_DIR}/git-diff-check-exit-code.txt"
+
+          if [[ "${diff_check_exit}" -ne 0 ]]; then
+            cat "${OUTPUT_DIR}/git-diff-check.txt"
+            echo "::error::Generated diff contains whitespace errors."
+          fi
+
+      - name: Run Maven tests on rewritten workspace
+        id: tests
+        if: steps.rewrite.outputs.exit_code == '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set +e
+          "${MAVEN_CMD}" -B -ntp test > "${OUTPUT_DIR}/maven-test.log" 2>&1
+          test_exit=$?
+          set -e
+
+          cat "${OUTPUT_DIR}/maven-test.log"
+          printf '%s\n' "${test_exit}" > "${OUTPUT_DIR}/maven-test-exit-code.txt"
+          echo "exit_code=${test_exit}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${test_exit}" -ne 0 ]]; then
+            echo "::error::Maven tests failed after applying the generated recipe."
+          fi
+
+      - name: Record skipped Maven test
+        if: steps.rewrite.outputs.exit_code != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SKIPPED_BECAUSE_OPENREWRITE_FAILED" > "${OUTPUT_DIR}/maven-test-result.txt"
+
+      - name: Create Step 8 result
+        if: always()
+        shell: bash
+        env:
+          STEP7_RUN_ID: ${{ steps.source.outputs.run_id }}
+          REWRITE_EXIT: ${{ steps.rewrite.outputs.exit_code }}
+          TEST_EXIT: ${{ steps.tests.outputs.exit_code }}
+          CHANGED_COUNT: ${{ steps.diff.outputs.changed_count }}
+        run: |
+          set -euo pipefail
+
+          rewrite_exit="${REWRITE_EXIT:-not-run}"
+          test_exit="${TEST_EXIT:-not-run}"
+          changed_count="${CHANGED_COUNT:-0}"
+          diff_check_exit="not-run"
+          if [[ -f "${OUTPUT_DIR}/git-diff-check-exit-code.txt" ]]; then
+            diff_check_exit="$(cat "${OUTPUT_DIR}/git-diff-check-exit-code.txt")"
+          fi
+
+          STEP7_RUN_ID="${STEP7_RUN_ID}" \
+          STEP7_ARTIFACT_NAME="${STEP7_ARTIFACT_NAME}" \
+          PR_NUMBER="${PR_NUMBER}" \
+          PR_HEAD_SHA="${PR_HEAD_SHA}" \
+          RECIPE_NAME="${RECIPE_NAME}" \
+          REWRITE_MAVEN_PLUGIN_VERSION="${REWRITE_MAVEN_PLUGIN_VERSION}" \
+          REWRITE_EXIT="${rewrite_exit}" \
+          TEST_EXIT="${test_exit}" \
+          DIFF_CHECK_EXIT="${diff_check_exit}" \
+          CHANGED_COUNT="${changed_count}" \
+          OUTPUT_DIR="${OUTPUT_DIR}" \
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+
+          def parse_exit(value):
+              try:
+                  return int(value)
+              except (TypeError, ValueError):
+                  return None
+
+          rewrite_exit = parse_exit(os.environ["REWRITE_EXIT"])
+          test_exit = parse_exit(os.environ["TEST_EXIT"])
+          diff_check_exit = parse_exit(os.environ["DIFF_CHECK_EXIT"])
+          changed_count = int(os.environ["CHANGED_COUNT"])
+
+          successful = (
+              rewrite_exit == 0
+              and diff_check_exit == 0
+              and test_exit == 0
+          )
+
+          result = {
+              "schemaVersion": 1,
+              "sourceStep7RunId": int(os.environ["STEP7_RUN_ID"]),
+              "sourceArtifact": os.environ["STEP7_ARTIFACT_NAME"],
+              "pullRequest": int(os.environ["PR_NUMBER"]),
+              "headSha": os.environ["PR_HEAD_SHA"],
+              "recipeName": os.environ["RECIPE_NAME"],
+              "rewriteMavenPluginVersion": os.environ["REWRITE_MAVEN_PLUGIN_VERSION"],
+              "rewriteExitCode": rewrite_exit,
+              "gitDiffCheckExitCode": diff_check_exit,
+              "mavenTestExitCode": test_exit,
+              "changedFileCount": changed_count,
+              "successful": successful,
+              "commitCreated": False,
+              "pushPerformed": False,
+          }
+
+          (output_dir / "step8-result.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          {
+            echo "## OpenRewrite migration verification"
+            echo
+            echo "- PR: \`#${PR_NUMBER}\`"
+            echo "- Analyzed HEAD: \`${PR_HEAD_SHA}\`"
+            echo "- Source Step 7 run: \`${STEP7_RUN_ID}\`"
+            echo "- Recipe: \`${RECIPE_NAME}\`"
+            echo "- OpenRewrite Maven plugin: \`${REWRITE_MAVEN_PLUGIN_VERSION}\`"
+            echo "- Changed files: \`${changed_count}\`"
+            echo "- OpenRewrite exit: \`${rewrite_exit}\`"
+            echo "- git diff --check exit: \`${diff_check_exit}\`"
+            echo "- Maven test exit: \`${test_exit}\`"
+            echo "- Commit created: \`false\`"
+            echo "- Push performed: \`false\`"
+            echo
+            if [[ -s "${OUTPUT_DIR}/rewrite-diff-stat.txt" ]]; then
+              echo '```text'
+              cat "${OUTPUT_DIR}/rewrite-diff-stat.txt"
+              echo '```'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Create checksums
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -d "${OUTPUT_DIR:-}" ]]; then
+            (
+              cd "${OUTPUT_DIR}"
+              find . -type f ! -name SHA256SUMS -print0 \
+                | sort -z \
+                | xargs -0 sha256sum \
+                > SHA256SUMS
+            )
+          fi
+
+      - name: Upload Step 8 verification artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pr-openrewrite-verification-${{ env.PR_NUMBER || 'unknown' }}-${{ steps.source.outputs.run_id }}
+          path: ${{ runner.temp }}/step8-output
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce verification result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          result="${RUNNER_TEMP}/step8-output/step8-result.json"
+          if [[ ! -s "${result}" ]]; then
+            echo "::error::Step 8 result was not created."
+            exit 1
+          fi
+
+          if [[ "$(jq -r '.successful' "${result}")" != "true" ]]; then
+            echo "::error::OpenRewrite migration verification failed. See uploaded artifact for logs and diff."
+            exit 1
+          fi
