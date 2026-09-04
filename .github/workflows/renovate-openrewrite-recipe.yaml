@@ -1,0 +1,205 @@
+name: PR 07 - Generate OpenRewrite recipe
+
+on:
+  workflow_run:
+    workflows:
+      - PR 06 - AI migration plan
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      step6_run_id:
+        description: GitHub Actions run ID of a successful PR 06 - AI migration plan run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  generate-recipe:
+    name: Generate deterministic OpenRewrite recipe
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    env:
+      GENERATOR_SHA256: "28bd030850bcd01ed06102c27c9847259268ab12f96fbc76147fbab279424984"
+
+    steps:
+      - name: Resolve Step 6 run
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          AUTO_RUN_ID: ${{ github.event.workflow_run.id }}
+          MANUAL_RUN_ID: ${{ inputs.step6_run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            run_id="${MANUAL_RUN_ID}"
+          else
+            run_id="${AUTO_RUN_ID}"
+          fi
+
+          if [[ ! "${run_id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid Step 6 run ID: ${run_id}"
+            exit 1
+          fi
+
+          run_json="$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}")"
+          run_name="$(jq -r '.name' <<<"${run_json}")"
+          conclusion="$(jq -r '.conclusion' <<<"${run_json}")"
+
+          if [[ "${run_name}" != "PR 06 - AI migration plan" ]]; then
+            echo "::error::Run ${run_id} belongs to '${run_name}', not 'PR 06 - AI migration plan'."
+            exit 1
+          fi
+
+          if [[ "${conclusion}" != "success" ]]; then
+            echo "::error::Step 6 run ${run_id} conclusion is '${conclusion}', expected 'success'."
+            exit 1
+          fi
+
+          echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download Step 6 artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          input_dir="${RUNNER_TEMP}/step6-input"
+          rm -rf -- "${input_dir}"
+          mkdir -p -- "${input_dir}"
+
+          artifact_name="$(
+            gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+              --jq '.artifacts[] | select(.expired == false) | .name' \
+              | grep '^pr-ai-migration-plan-' \
+              | head -n 1
+          )"
+
+          if [[ -z "${artifact_name}" ]]; then
+            echo "::error::No non-expired pr-ai-migration-plan-* artifact found on Step 6 run ${RUN_ID}."
+            exit 1
+          fi
+
+          gh run download "${RUN_ID}" \
+            --repo "${REPOSITORY}" \
+            --name "${artifact_name}" \
+            --dir "${input_dir}"
+
+          plan_path="$(find "${input_dir}" -type f -name ai-migration-plan.json -print -quit)"
+          if [[ -z "${plan_path}" ]]; then
+            echo "::error::ai-migration-plan.json missing from Step 6 artifact."
+            exit 1
+          fi
+
+          echo "PLAN_PATH=${plan_path}" >> "${GITHUB_ENV}"
+          echo "STEP6_ARTIFACT_NAME=${artifact_name}" >> "${GITHUB_ENV}"
+
+      - name: Checkout trusted generator
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Verify generator
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          generator="${GITHUB_WORKSPACE}/.github/scripts/openrewrite-recipe-generator.py"
+
+          if [[ ! -s "${generator}" ]]; then
+            echo "::error::OpenRewrite recipe generator not found: ${generator}"
+            exit 1
+          fi
+
+          printf '%s  %s\n' "${GENERATOR_SHA256}" "${generator}" \
+            | sha256sum --check --strict -
+
+          python3 -m py_compile "${generator}"
+
+      - name: Generate OpenRewrite recipe
+        id: generate
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/step7-output
+        run: |
+          set -euo pipefail
+
+          rm -rf -- "${OUTPUT_DIR}"
+          mkdir -p -- "${OUTPUT_DIR}/analysis-tools"
+
+          pr_number="$(jq -r '.pullRequest // empty' "${PLAN_PATH}")"
+          if [[ -z "${pr_number}" || ! "${pr_number}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid or missing pullRequest in ai-migration-plan.json"
+            exit 1
+          fi
+
+          recipe_name="com.gepardec.renovate.PR${pr_number}DependencyMigration"
+          display_name="PR ${pr_number} dependency migration"
+
+          python3 "${GITHUB_WORKSPACE}/.github/scripts/openrewrite-recipe-generator.py" \
+            --plan "${PLAN_PATH}" \
+            --recipe "${OUTPUT_DIR}/rewrite.yml" \
+            --manifest "${OUTPUT_DIR}/openrewrite-recipe-manifest.json" \
+            --recipe-name "${recipe_name}" \
+            --display-name "${display_name}"
+
+          cp "${PLAN_PATH}" "${OUTPUT_DIR}/ai-migration-plan.json"
+          cp "${GITHUB_WORKSPACE}/.github/scripts/openrewrite-recipe-generator.py" \
+            "${OUTPUT_DIR}/analysis-tools/openrewrite-recipe-generator.py"
+
+          {
+            echo "## Generated OpenRewrite recipe"
+            echo
+            echo "- Source Step 6 run: \`${{ steps.source.outputs.run_id }}\`"
+            echo "- Source artifact: \`${STEP6_ARTIFACT_NAME}\`"
+            echo "- Recipe: \`${recipe_name}\`"
+            echo "- Recipe steps: \`$(jq -r '.summary.generatedRecipeStepCount' "${OUTPUT_DIR}/openrewrite-recipe-manifest.json")\`"
+            echo
+            echo '```yaml'
+            cat "${OUTPUT_DIR}/rewrite.yml"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "output_dir=${OUTPUT_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create checksums
+        if: always()
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/step7-output
+        run: |
+          set -euo pipefail
+
+          if [[ -d "${OUTPUT_DIR}" ]]; then
+            (
+              cd "${OUTPUT_DIR}"
+              find . -type f ! -name SHA256SUMS -print0 \
+                | sort -z \
+                | xargs -0 sha256sum \
+                > SHA256SUMS
+            )
+          fi
+
+      - name: Upload OpenRewrite recipe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-openrewrite-recipe-${{ steps.generate.outputs.pr_number || 'unknown' }}-${{ steps.source.outputs.run_id }}
+          path: ${{ runner.temp }}/step7-output
+          if-no-files-found: warn
+          retention-days: 14
