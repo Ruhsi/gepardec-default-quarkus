@@ -70,6 +70,11 @@ def build_removed_candidates(target, added_dependencies, max_candidates=20):
     candidates = []
     for dep in added_dependencies:
         for class_name in dep.get('classNames', []):
+            # A replacement must actually change the referenced symbol.
+            # The same FQCN can appear again through another added dependency,
+            # but mapping a type to itself is never a source migration.
+            if class_name == old_type:
+                continue
             if simple_name(class_name) != simple_name(old_type):
                 continue
             score = candidate_score_for_type(old_type, class_name, old_scope, dep.get('scopeCategory', ''))
@@ -124,13 +129,19 @@ def build_japicmp_candidates(target, api_changes, max_candidates=30):
         score = api_candidate_score(target, candidate)
         if score < 30:
             continue
-        candidate_id = stable_id('cand', coordinate, candidate.get('newVersion', ''), candidate.get('signature', ''))
+        candidate_symbol = candidate.get('signature', '')
+        target_symbol = target.get('signature') or target.get('targetSignature') or ''
+        # A modified/new API entry with the exact same symbol is useful evidence,
+        # but it is not a replacement candidate.
+        if candidate_symbol and target_symbol and candidate_symbol == target_symbol:
+            continue
+        candidate_id = stable_id('cand', coordinate, candidate.get('newVersion', ''), candidate_symbol)
         candidates.append({
             'candidateId': candidate_id,
             'kind': candidate.get('kind', ''),
             'coordinate': coordinate,
             'version': candidate.get('newVersion', ''),
-            'symbol': candidate.get('signature', ''),
+            'symbol': candidate_symbol,
             'scopeCategory': candidate.get('scopeCategory', ''),
             'evidence': {
                 'score': score,
@@ -250,7 +261,7 @@ def build(args):
         'analysisQuality': usage_summary.get('summary', {}).get('analysisQuality', 'UNKNOWN'),
         'impactCount': len(impacts),
         'rules': {
-            'candidatePolicy': 'A replacement may only reference a replacementCandidateId listed for the same impact.',
+            'candidatePolicy': 'A replacement may only reference a replacementCandidateId listed for the same impact, and the replacement symbol must differ from the source symbol.',
             'noInventedSymbols': True,
             'sourceEvidenceIsMinimal': True,
             'bytecodeInspection': False
@@ -287,7 +298,7 @@ def build(args):
     }
     (output_dir / 'ai-migration-output-schema.json').write_text(json.dumps(schema, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
-    instructions = '''You are a dependency migration planner. Use only the supplied evidence. Do not invent APIs, Maven coordinates, classes, methods, fields, or constructors. Return exactly one decision for every impactId. A REPLACE decision must use a replacementCandidateId listed under the same impact. If the evidence is ambiguous or no candidate is sufficient, return MANUAL_REVIEW. For a binary-only incompatibility that does not require a source edit, use NO_SOURCE_CHANGE only when the supplied compatibility evidence supports it. Prefer the smallest source transformation that restores compatibility. Keep rationale concise and evidence-based. Do not generate source code or OpenRewrite recipes.'''
+    instructions = '''You are a dependency migration planner. Use only the supplied evidence. Do not invent APIs, Maven coordinates, classes, methods, fields, or constructors. Return exactly one decision for every impactId. A REPLACE decision must use a replacementCandidateId listed under the same impact. Never map a symbol to itself; if no actual replacement is supported by the evidence, return MANUAL_REVIEW. If the evidence is ambiguous or no candidate is sufficient, return MANUAL_REVIEW. For a binary-only incompatibility that does not require a source edit, use NO_SOURCE_CHANGE only when the supplied compatibility evidence supports it. Prefer the smallest source transformation that restores compatibility. Keep rationale concise and evidence-based. Do not generate source code or OpenRewrite recipes.'''
     (output_dir / 'ai-migration-instructions.txt').write_text(instructions + '\n', encoding='utf-8')
 
     print(json.dumps({'impactCount': len(impacts), 'needsAi': bool(impacts)}, sort_keys=True))
@@ -328,6 +339,11 @@ def validate(args):
                 errors.append(f'{impact_id}: REPLACE requires replacementCandidateId')
             elif candidate_id not in candidate_by_id:
                 errors.append(f'{impact_id}: candidate {candidate_id} is not allowed for this impact')
+            else:
+                replacement_symbol = candidate_by_id[candidate_id].get('symbol', '')
+                target_symbol = impact.get('target', {}).get('symbol', '')
+                if replacement_symbol and target_symbol and replacement_symbol == target_symbol:
+                    errors.append(f'{impact_id}: replacement maps symbol to itself: {target_symbol}')
             if transformation not in impact.get('allowedTransformations', []):
                 errors.append(f'{impact_id}: transformation {transformation} not allowed for target')
         elif decision == 'NO_SOURCE_CHANGE':
