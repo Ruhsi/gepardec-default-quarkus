@@ -162,7 +162,6 @@ jobs:
           request = {
               "model": os.environ["MODEL"],
               "store": False,
-              "temperature": 0,
               "reasoning": {
                   "effort": os.environ["REASONING_EFFORT"]
               },
