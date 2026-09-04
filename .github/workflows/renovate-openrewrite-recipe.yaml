@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GENERATOR_SHA256: "28bd030850bcd01ed06102c27c9847259268ab12f96fbc76147fbab279424984"
+      GENERATOR_SHA256: "c648c5b3124d80a79707fe722b08b379b163a17c809d1ea20b3dfeddb1e3dc43"
 
     steps:
       - name: Resolve Step 6 run
@@ -108,7 +108,7 @@ jobs:
           echo "STEP6_ARTIFACT_NAME=${artifact_name}" >> "${GITHUB_ENV}"
 
       - name: Checkout trusted generator
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -197,7 +197,7 @@ jobs:
 
       - name: Upload OpenRewrite recipe artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: pr-openrewrite-recipe-${{ steps.generate.outputs.pr_number || 'unknown' }}-${{ steps.source.outputs.run_id }}
           path: ${{ runner.temp }}/step7-output
