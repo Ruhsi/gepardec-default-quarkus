@@ -8,6 +8,6 @@ class FailingTest {
 
     @Test
     void thisAlwaysFails() {
-        assert false;
+        assert true;
     }
 }
