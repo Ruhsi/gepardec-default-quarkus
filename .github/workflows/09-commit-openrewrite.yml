@@ -293,12 +293,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          current_head_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          # The Git ref is authoritative immediately after the push.
+          remote_head_sha="$(git ls-remote --heads origin "refs/heads/${PR_HEAD_REF}" | awk '{print $1}')"
 
-          if [[ "${current_head_sha}" != "${COMMIT_SHA}" ]]; then
-            echo "::error::Push completed but PR #${PR_NUMBER} HEAD is ${current_head_sha}, expected ${COMMIT_SHA}."
+          if [[ "${remote_head_sha}" != "${COMMIT_SHA}" ]]; then
+            echo "::error::Push completed but remote branch ${PR_HEAD_REF} is ${remote_head_sha:-<missing>}, expected ${COMMIT_SHA}."
             exit 1
           fi
+
+          # GitHub's Pull Request API can lag the Git ref for a few seconds.
+          # Poll it so eventual consistency does not turn a successful push into a failed workflow.
+          current_head_sha=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            current_head_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+
+            if [[ "${current_head_sha}" == "${COMMIT_SHA}" ]]; then
+              echo "PR #${PR_NUMBER} now points to ${COMMIT_SHA}."
+              exit 0
+            fi
+
+            echo "PR API still reports ${current_head_sha}; expected ${COMMIT_SHA} (attempt ${attempt}/10)."
+            sleep 2
+          done
+
+          echo "::error::Remote branch points to ${COMMIT_SHA}, but PR #${PR_NUMBER} API still reports ${current_head_sha} after retries."
+          exit 1
 
       - name: Create Step 9 audit artifact
         if: always()
