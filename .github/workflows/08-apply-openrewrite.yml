@@ -117,6 +117,7 @@ jobs:
           fi
 
           pr_number="$(jq -r '.pullRequest // empty' "${plan_path}")"
+          base_sha="$(jq -r '.baseSha // empty' "${plan_path}")"
           head_sha="$(jq -r '.headSha // empty' "${plan_path}")"
           repository="$(jq -r '.repository // empty' "${plan_path}")"
           recipe_name="$(jq -r '.output.recipeName // .recipe.name // .recipeName // empty' "${manifest_path}")"
@@ -127,6 +128,11 @@ jobs:
 
           if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
             echo "::error::Invalid pullRequest in ai-migration-plan.json: ${pr_number}"
+            exit 1
+          fi
+
+          if [[ ! "${base_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid baseSha in ai-migration-plan.json: ${base_sha}"
             exit 1
           fi
 
@@ -151,6 +157,7 @@ jobs:
           echo "RECIPE_MANIFEST_PATH=${manifest_path}" >> "${GITHUB_ENV}"
           echo "PLAN_PATH=${plan_path}" >> "${GITHUB_ENV}"
           echo "PR_NUMBER=${pr_number}" >> "${GITHUB_ENV}"
+          echo "PR_BASE_SHA=${base_sha}" >> "${GITHUB_ENV}"
           echo "PR_HEAD_SHA=${head_sha}" >> "${GITHUB_ENV}"
           echo "RECIPE_NAME=${recipe_name}" >> "${GITHUB_ENV}"
 
@@ -205,20 +212,57 @@ jobs:
             echo "MAVEN_CMD=mvn" >> "${GITHUB_ENV}"
           fi
 
+      - name: Verify pre-upgrade base build
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          output_dir="${RUNNER_TEMP}/step8-output"
+          mkdir -p -- "${output_dir}"
+          echo "OUTPUT_DIR=${output_dir}" >> "${GITHUB_ENV}"
+
+          baseline_dir="${RUNNER_TEMP}/baseline-worktree"
+          rm -rf -- "${baseline_dir}"
+          git worktree add --detach "${baseline_dir}" "${PR_BASE_SHA}"
+
+          set +e
+          (
+            cd "${baseline_dir}"
+            if [[ -f ./mvnw ]]; then
+              chmod +x ./mvnw
+              ./mvnw -B -ntp test
+            else
+              mvn -B -ntp test
+            fi
+          ) > "${output_dir}/baseline-maven-test.log" 2>&1
+          baseline_exit=$?
+          set -e
+
+          cat "${output_dir}/baseline-maven-test.log"
+          printf '%s\n' "${baseline_exit}" > "${output_dir}/baseline-maven-test-exit-code.txt"
+          echo "exit_code=${baseline_exit}" >> "${GITHUB_OUTPUT}"
+
+          git worktree remove --force "${baseline_dir}" || true
+
+          if [[ "${baseline_exit}" -ne 0 ]]; then
+            echo "::error::BASELINE_BUILD_FAILED: the pre-upgrade base SHA ${PR_BASE_SHA} already fails mvn test. Fix the test project before evaluating the generated migration."
+          fi
+
       - name: Build and install generated custom recipe
-        if: env.CUSTOM_RECIPE_POM != ''
+        if: steps.baseline.outputs.exit_code == '0' && env.CUSTOM_RECIPE_POM != ''
         shell: bash
         run: |
           set -euo pipefail
           mvn -B -ntp -f "${CUSTOM_RECIPE_POM}" -DskipTests install
 
       - name: Snapshot workspace before rewrite
+        if: steps.baseline.outputs.exit_code == '0'
         shell: bash
         run: |
           set -euo pipefail
 
           output_dir="${RUNNER_TEMP}/step8-output"
-          rm -rf -- "${output_dir}"
           mkdir -p -- "${output_dir}"
 
           git status --porcelain=v1 > "${output_dir}/git-status-before.txt"
@@ -231,6 +275,7 @@ jobs:
 
       - name: Apply generated OpenRewrite recipe
         id: rewrite
+        if: steps.baseline.outputs.exit_code == '0'
         shell: bash
         run: |
           set -euo pipefail
@@ -269,7 +314,7 @@ jobs:
 
       - name: Validate generated diff
         id: diff
-        if: always()
+        if: always() && steps.baseline.outputs.exit_code == '0'
         shell: bash
         run: |
           set -euo pipefail
@@ -314,7 +359,7 @@ jobs:
           fi
 
       - name: Record skipped Maven test
-        if: steps.rewrite.outputs.exit_code != '0'
+        if: steps.baseline.outputs.exit_code == '0' && steps.rewrite.outputs.exit_code != '0'
         shell: bash
         run: |
           set -euo pipefail
@@ -325,12 +370,14 @@ jobs:
         shell: bash
         env:
           STEP7_RUN_ID: ${{ steps.source.outputs.run_id }}
+          BASELINE_EXIT: ${{ steps.baseline.outputs.exit_code }}
           REWRITE_EXIT: ${{ steps.rewrite.outputs.exit_code }}
           TEST_EXIT: ${{ steps.tests.outputs.exit_code }}
           CHANGED_COUNT: ${{ steps.diff.outputs.changed_count }}
         run: |
           set -euo pipefail
 
+          baseline_exit="${BASELINE_EXIT:-not-run}"
           rewrite_exit="${REWRITE_EXIT:-not-run}"
           test_exit="${TEST_EXIT:-not-run}"
           changed_count="${CHANGED_COUNT:-0}"
@@ -342,9 +389,11 @@ jobs:
           STEP7_RUN_ID="${STEP7_RUN_ID}" \
           STEP7_ARTIFACT_NAME="${STEP7_ARTIFACT_NAME}" \
           PR_NUMBER="${PR_NUMBER}" \
+          PR_BASE_SHA="${PR_BASE_SHA}" \
           PR_HEAD_SHA="${PR_HEAD_SHA}" \
           RECIPE_NAME="${RECIPE_NAME}" \
           REWRITE_MAVEN_PLUGIN_VERSION="${REWRITE_MAVEN_PLUGIN_VERSION}" \
+          BASELINE_EXIT="${baseline_exit}" \
           REWRITE_EXIT="${rewrite_exit}" \
           TEST_EXIT="${test_exit}" \
           DIFF_CHECK_EXIT="${diff_check_exit}" \
@@ -363,30 +412,46 @@ jobs:
               except (TypeError, ValueError):
                   return None
 
+          baseline_exit = parse_exit(os.environ["BASELINE_EXIT"])
           rewrite_exit = parse_exit(os.environ["REWRITE_EXIT"])
           test_exit = parse_exit(os.environ["TEST_EXIT"])
           diff_check_exit = parse_exit(os.environ["DIFF_CHECK_EXIT"])
           changed_count = int(os.environ["CHANGED_COUNT"])
 
           successful = (
-              rewrite_exit == 0
+              baseline_exit == 0
+              and rewrite_exit == 0
               and diff_check_exit == 0
               and test_exit == 0
           )
+
+          if baseline_exit not in (None, 0):
+              failure_reason = "BASELINE_BUILD_FAILED"
+          elif rewrite_exit not in (None, 0):
+              failure_reason = "OPENREWRITE_FAILED"
+          elif diff_check_exit not in (None, 0):
+              failure_reason = "DIFF_CHECK_FAILED"
+          elif test_exit not in (None, 0):
+              failure_reason = "MIGRATED_BUILD_FAILED"
+          else:
+              failure_reason = None
 
           result = {
               "schemaVersion": 1,
               "sourceStep7RunId": int(os.environ["STEP7_RUN_ID"]),
               "sourceArtifact": os.environ["STEP7_ARTIFACT_NAME"],
               "pullRequest": int(os.environ["PR_NUMBER"]),
+              "baseSha": os.environ["PR_BASE_SHA"],
               "headSha": os.environ["PR_HEAD_SHA"],
               "recipeName": os.environ["RECIPE_NAME"],
               "rewriteMavenPluginVersion": os.environ["REWRITE_MAVEN_PLUGIN_VERSION"],
+              "baselineMavenTestExitCode": baseline_exit,
               "rewriteExitCode": rewrite_exit,
               "gitDiffCheckExitCode": diff_check_exit,
               "mavenTestExitCode": test_exit,
               "changedFileCount": changed_count,
               "successful": successful,
+              "failureReason": failure_reason,
               "commitCreated": False,
               "pushPerformed": False,
           }
@@ -401,11 +466,13 @@ jobs:
             echo "## OpenRewrite migration verification"
             echo
             echo "- PR: \`#${PR_NUMBER}\`"
+            echo "- Pre-upgrade base: \`${PR_BASE_SHA}\`"
             echo "- Analyzed HEAD: \`${PR_HEAD_SHA}\`"
             echo "- Source Step 7 run: \`${STEP7_RUN_ID}\`"
             echo "- Recipe: \`${RECIPE_NAME}\`"
             echo "- OpenRewrite Maven plugin: \`${REWRITE_MAVEN_PLUGIN_VERSION}\`"
             echo "- Changed files: \`${changed_count}\`"
+            echo "- Baseline Maven test exit: \`${baseline_exit}\`"
             echo "- OpenRewrite exit: \`${rewrite_exit}\`"
             echo "- git diff --check exit: \`${diff_check_exit}\`"
             echo "- Maven test exit: \`${test_exit}\`"
