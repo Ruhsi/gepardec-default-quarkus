@@ -154,6 +154,15 @@ jobs:
           echo "PR_HEAD_SHA=${head_sha}" >> "${GITHUB_ENV}"
           echo "RECIPE_NAME=${recipe_name}" >> "${GITHUB_ENV}"
 
+          custom_pom="$(find "${input_dir}" -type f -path '*/custom-recipe/pom.xml' -print -quit)"
+          custom_coords="$(jq -r '.customRecipe.artifactCoordinates // empty' "${manifest_path}")"
+          if [[ -n "${custom_pom}" ]]; then
+            echo "CUSTOM_RECIPE_POM=${custom_pom}" >> "${GITHUB_ENV}"
+          fi
+          if [[ -n "${custom_coords}" ]]; then
+            echo "CUSTOM_RECIPE_COORDS=${custom_coords}" >> "${GITHUB_ENV}"
+          fi
+
       - name: Verify PR head still belongs to PR
         shell: bash
         env:
@@ -196,6 +205,13 @@ jobs:
             echo "MAVEN_CMD=mvn" >> "${GITHUB_ENV}"
           fi
 
+      - name: Build and install generated custom recipe
+        if: env.CUSTOM_RECIPE_POM != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn -B -ntp -f "${CUSTOM_RECIPE_POM}" -DskipTests install
+
       - name: Snapshot workspace before rewrite
         shell: bash
         run: |
@@ -220,13 +236,19 @@ jobs:
           set -euo pipefail
 
           set +e
-          "${MAVEN_CMD}" \
-            -B \
-            -ntp \
-            "org.openrewrite.maven:rewrite-maven-plugin:${REWRITE_MAVEN_PLUGIN_VERSION}:runNoFork" \
-            "-Drewrite.configLocation=${RECIPE_PATH}" \
-            "-Drewrite.activeRecipes=${RECIPE_NAME}" \
-            -Drewrite.exportDatatables=false \
+          rewrite_args=(
+            -B
+            -ntp
+            "org.openrewrite.maven:rewrite-maven-plugin:${REWRITE_MAVEN_PLUGIN_VERSION}:runNoFork"
+            "-Drewrite.configLocation=${RECIPE_PATH}"
+            "-Drewrite.activeRecipes=${RECIPE_NAME}"
+            -Drewrite.exportDatatables=false
+          )
+          if [[ -n "${CUSTOM_RECIPE_COORDS:-}" ]]; then
+            rewrite_args+=("-Drewrite.recipeArtifactCoordinates=${CUSTOM_RECIPE_COORDS}")
+          fi
+
+          "${MAVEN_CMD}" "${rewrite_args[@]}" \
             > "${OUTPUT_DIR}/openrewrite.log" 2>&1
           rewrite_exit=$?
           set -e

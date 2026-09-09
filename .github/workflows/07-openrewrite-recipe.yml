@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GENERATOR_SHA256: "c648c5b3124d80a79707fe722b08b379b163a17c809d1ea20b3dfeddb1e3dc43"
+      GENERATOR_SHA256: "1ddc30214658f248f6ba47efb34e404620a6c05d0812498871406a1c55b191f0"
 
     steps:
       - name: Resolve Step 6 run
@@ -155,7 +155,8 @@ jobs:
             --recipe "${OUTPUT_DIR}/rewrite.yml" \
             --manifest "${OUTPUT_DIR}/openrewrite-recipe-manifest.json" \
             --recipe-name "${recipe_name}" \
-            --display-name "${display_name}"
+            --display-name "${display_name}" \
+            --output-dir "${OUTPUT_DIR}"
 
           cp "${PLAN_PATH}" "${OUTPUT_DIR}/ai-migration-plan.json"
           cp "${GITHUB_WORKSPACE}/.github/scripts/openrewrite-recipe-generator.py" \
@@ -176,6 +177,22 @@ jobs:
 
           echo "output_dir=${OUTPUT_DIR}" >> "${GITHUB_OUTPUT}"
           echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate generated custom recipe module
+        if: always()
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/step7-output
+        run: |
+          set -euo pipefail
+
+          custom_pom="${OUTPUT_DIR}/custom-recipe/pom.xml"
+          if [[ ! -f "${custom_pom}" ]]; then
+            echo "No custom Java recipe module generated."
+            exit 0
+          fi
+
+          mvn -B -ntp -f "${custom_pom}" -DskipTests package
 
       - name: Create checksums
         if: always()

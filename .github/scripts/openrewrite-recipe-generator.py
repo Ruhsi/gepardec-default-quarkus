@@ -6,248 +6,181 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-ALLOWED_TRANSFORMATIONS = {"CHANGE_TYPE"}
 FQCN_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$")
+PLACEHOLDER_RE = re.compile(r"#\{(p\d+|select)\}")
 
 
-def fail(msg: str) -> None:
+def fail(msg):
     raise SystemExit(msg)
 
 
-def load_json(path: Path):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        fail(f"Failed to read JSON {path}: {exc}")
+def load_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def yaml_scalar(value: str) -> str:
-    # JSON string syntax is valid YAML and deterministic.
-    return json.dumps(value, ensure_ascii=False)
-
-
-def normalize_decisions(plan):
-    decisions = plan.get("decisions")
-    if not isinstance(decisions, list):
-        fail("ai-migration-plan.json must contain a decisions array")
-
-    normalized = []
-    seen_old = set()
-    manual_review_ids = []
-
-    for index, item in enumerate(decisions):
-        if not isinstance(item, dict):
-            fail(f"decisions[{index}] must be an object")
-
-        decision = item.get("decision")
-        if decision == "MANUAL_REVIEW":
-            manual_review_ids.append(str(item.get("impactId", index)))
-            continue
-        if decision == "NO_SOURCE_CHANGE":
-            continue
-        if decision != "REPLACE":
-            fail(f"decisions[{index}] has unsupported decision {decision!r}")
-
-        transformation = item.get("transformation")
-        if transformation not in ALLOWED_TRANSFORMATIONS:
-            fail(
-                f"decisions[{index}] has unsupported transformation {transformation!r}; "
-                f"allowed: {sorted(ALLOWED_TRANSFORMATIONS)}"
-            )
-
-        old_type = item.get("sourceSymbol") or item.get("oldType") or item.get("sourceTarget")
-        new_type = item.get("replacementSymbol") or item.get("newType")
-
-        # Support the validated planner shape where target/replacement are nested.
-        if old_type is None and isinstance(item.get("target"), dict):
-            old_type = item["target"].get("symbol")
-        if new_type is None and isinstance(item.get("replacement"), dict):
-            new_type = item["replacement"].get("symbol")
-
-        if not isinstance(old_type, str) or not FQCN_RE.match(old_type):
-            fail(f"decisions[{index}] has invalid source type: {old_type!r}")
-        if not isinstance(new_type, str) or not FQCN_RE.match(new_type):
-            fail(f"decisions[{index}] has invalid replacement type: {new_type!r}")
-        if old_type == new_type:
-            fail(f"decisions[{index}] maps a type to itself: {old_type}")
-        if old_type in seen_old:
-            fail(f"duplicate CHANGE_TYPE source type: {old_type}")
-        seen_old.add(old_type)
-
-        normalized.append({
-            "transformation": "CHANGE_TYPE",
-            "oldType": old_type,
-            "newType": new_type,
-        })
-
-    if manual_review_ids:
-        fail(
-            "Cannot generate a complete OpenRewrite recipe while MANUAL_REVIEW decisions exist: "
-            + ", ".join(sorted(manual_review_ids))
-        )
-
-    normalized.sort(key=lambda x: (x["oldType"], x["newType"]))
-    return normalized
+def yaml_scalar(v):
+    return json.dumps(v, ensure_ascii=False)
 
 
 def package_candidates(change):
-    """Return package rename candidates that preserve the complete type suffix.
-
-    Example:
-      javax.ws.rs.core.MediaType -> jakarta.ws.rs.core.MediaType
-    contains candidate:
-      javax.ws.rs -> jakarta.ws.rs   (suffix core.MediaType is unchanged)
-    """
     old_parts = change["oldType"].split(".")
     new_parts = change["newType"].split(".")
-    candidates = set()
-
-    # Leave at least one segment as the type suffix.
+    out = set()
     for old_len in range(1, len(old_parts)):
         old_suffix = old_parts[old_len:]
         for new_len in range(1, len(new_parts)):
-            if old_suffix != new_parts[new_len:]:
-                continue
-            old_pkg = ".".join(old_parts[:old_len])
-            new_pkg = ".".join(new_parts[:new_len])
-            if old_pkg == new_pkg:
-                continue
-            candidates.add((old_pkg, new_pkg))
-
-    return candidates
+            if old_suffix == new_parts[new_len:]:
+                a = ".".join(old_parts[:old_len]); b = ".".join(new_parts[:new_len])
+                if a != b:
+                    out.add((a,b))
+    return out
 
 
-def optimize_changes(changes):
-    """Collapse proven repeated type mappings into recursive ChangePackage steps.
-
-    Safety rules:
-    - at least two mappings must prove the same package rename;
-    - the suffix below the package boundary must be identical for every mapping;
-    - each input mapping is consumed by at most one package step;
-    - ungrouped mappings remain exact ChangeType operations.
-    """
+def optimize_type_changes(changes):
     candidate_to_indexes = defaultdict(set)
-    for index, change in enumerate(changes):
-        for candidate in package_candidates(change):
-            candidate_to_indexes[candidate].add(index)
-
+    for i,c in enumerate(changes):
+        for cand in package_candidates(c):
+            candidate_to_indexes[cand].add(i)
     remaining = set(range(len(changes)))
-    package_steps = []
-
+    pkg=[]
     while True:
-        viable = []
-        for (old_pkg, new_pkg), indexes in candidate_to_indexes.items():
-            covered = sorted(indexes & remaining)
-            if len(covered) < 2:
-                continue
-            specificity = old_pkg.count(".") + new_pkg.count(".") + 2
-            viable.append((len(covered), specificity, old_pkg, new_pkg, covered))
-
-        if not viable:
-            break
-
-        # Prefer maximum coverage first, then the most specific package boundary.
-        viable.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
-        _, _, old_pkg, new_pkg, covered = viable[0]
-
-        package_steps.append({
-            "transformation": "CHANGE_PACKAGE",
-            "oldPackage": old_pkg,
-            "newPackage": new_pkg,
-            "recursive": True,
-            "derivedFrom": [changes[i] for i in covered],
-        })
+        viable=[]
+        for (a,b), idxs in candidate_to_indexes.items():
+            covered=sorted(idxs & remaining)
+            if len(covered) < 2: continue
+            specificity=a.count('.')+b.count('.')+2
+            viable.append((len(covered), specificity, a,b,covered))
+        if not viable: break
+        viable.sort(key=lambda x:(-x[0],-x[1],x[2],x[3]))
+        _,_,a,b,covered=viable[0]
+        pkg.append({"kind":"CHANGE_PACKAGE","oldPackage":a,"newPackage":b,"recursive":True,"derivedFrom":[changes[i] for i in covered]})
         remaining.difference_update(covered)
-
-    type_steps = [changes[i] for i in sorted(remaining)]
-
-    # Stable output: package steps first, then exact type changes.
-    package_steps.sort(key=lambda x: (x["oldPackage"], x["newPackage"]))
-    type_steps.sort(key=lambda x: (x["oldType"], x["newType"]))
-    return package_steps + type_steps
+    exact=[{"kind":"CHANGE_TYPE",**changes[i]} for i in sorted(remaining)]
+    pkg.sort(key=lambda x:(x['oldPackage'],x['newPackage']))
+    exact.sort(key=lambda x:(x['oldType'],x['newType']))
+    return pkg+exact
 
 
-def render_recipe(recipe_name: str, display_name: str, steps):
-    lines = [
-        "type: specs.openrewrite.org/v1beta/recipe",
-        f"name: {recipe_name}",
-        f"displayName: {yaml_scalar(display_name)}",
-        'description: "Generated deterministically from a validated AI migration plan."',
-        "recipeList:",
-    ]
+def normalize(plan):
+    decisions=plan.get('decisions')
+    if not isinstance(decisions,list): fail('ai-migration-plan.json must contain decisions')
+    type_changes=[]; builtins=[]; custom=[]
+    seen=set()
+    for i,d in enumerate(decisions):
+        decision=d.get('decision')
+        if decision=='NO_SOURCE_CHANGE':
+            continue
+        ow=d.get('openRewrite') or {}
+        kind=ow.get('recipeKind')
+        impact=d.get('impactId',f'index-{i}')
+        if impact in seen: fail(f'duplicate impactId {impact}')
+        seen.add(impact)
+        if decision=='REPLACE':
+            target=(d.get('target') or {}).get('symbol')
+            repl=(d.get('replacement') or {}).get('symbol')
+            if not target or not repl or target==repl: fail(f'{impact}: invalid replacement mapping')
+            if not FQCN_RE.match(target) or not FQCN_RE.match(repl): fail(f'{impact}: replacement is not a type mapping')
+            type_changes.append({'impactId':impact,'oldType':target,'newType':repl})
+            continue
+        if decision!='REWRITE': fail(f'{impact}: unsupported decision {decision!r}')
+        if kind=='CHANGE_METHOD_NAME':
+            if not ow.get('methodPattern') or not ow.get('newMethodName'): fail(f'{impact}: CHANGE_METHOD_NAME incomplete')
+            builtins.append({'impactId':impact,'kind':kind,'methodPattern':ow['methodPattern'],'newMethodName':ow['newMethodName']})
+        elif kind=='INLINE_METHOD_CALLS':
+            if not ow.get('methodPattern') or not ow.get('replacement'): fail(f'{impact}: INLINE_METHOD_CALLS incomplete')
+            builtins.append({'impactId':impact,'kind':kind,'methodPattern':ow['methodPattern'],'replacement':ow['replacement'],'imports':sorted(set(ow.get('imports') or [])),'staticImports':sorted(set(ow.get('staticImports') or []))})
+        elif kind=='CUSTOM_JAVA_TEMPLATE':
+            if not ow.get('methodPattern') or not ow.get('replacement'): fail(f'{impact}: CUSTOM_JAVA_TEMPLATE incomplete')
+            custom.append({'impactId':impact,'kind':kind,'methodPattern':ow['methodPattern'],'replacement':ow['replacement'],'imports':sorted(set(ow.get('imports') or [])),'staticImports':sorted(set(ow.get('staticImports') or []))})
+        else:
+            fail(f'{impact}: REWRITE has unsupported openRewrite.recipeKind {kind!r}')
+    return optimize_type_changes(type_changes), builtins, custom
 
-    if not steps:
-        lines.append("  []")
-    else:
-        for step in steps:
-            if step["transformation"] == "CHANGE_PACKAGE":
-                lines.extend([
-                    "  - org.openrewrite.java.ChangePackage:",
-                    f"      oldPackageName: {yaml_scalar(step['oldPackage'])}",
-                    f"      newPackageName: {yaml_scalar(step['newPackage'])}",
-                    "      recursive: true",
-                ])
-            elif step["transformation"] == "CHANGE_TYPE":
-                lines.extend([
-                    "  - org.openrewrite.java.ChangeType:",
-                    f"      oldFullyQualifiedTypeName: {yaml_scalar(step['oldType'])}",
-                    f"      newFullyQualifiedTypeName: {yaml_scalar(step['newType'])}",
-                ])
-            else:
-                fail(f"Internal error: unsupported rendered transformation {step['transformation']!r}")
 
-    return "\n".join(lines) + "\n"
+def render_yaml(recipe_name, display_name, type_steps, builtins, custom_recipe_name=None):
+    lines=['type: specs.openrewrite.org/v1beta/recipe',f'name: {recipe_name}',f'displayName: {yaml_scalar(display_name)}','description: "Generated from a validated AI migration plan."','recipeList:']
+    count=0
+    for s in type_steps:
+        count+=1
+        if s['kind']=='CHANGE_PACKAGE':
+            lines += ['  - org.openrewrite.java.ChangePackage:',f"      oldPackageName: {yaml_scalar(s['oldPackage'])}",f"      newPackageName: {yaml_scalar(s['newPackage'])}",'      recursive: true']
+        else:
+            lines += ['  - org.openrewrite.java.ChangeType:',f"      oldFullyQualifiedTypeName: {yaml_scalar(s['oldType'])}",f"      newFullyQualifiedTypeName: {yaml_scalar(s['newType'])}"]
+    for s in builtins:
+        count+=1
+        if s['kind']=='CHANGE_METHOD_NAME':
+            lines += ['  - org.openrewrite.java.ChangeMethodName:',f"      methodPattern: {yaml_scalar(s['methodPattern'])}",f"      newMethodName: {yaml_scalar(s['newMethodName'])}"]
+        elif s['kind']=='INLINE_METHOD_CALLS':
+            lines += ['  - org.openrewrite.java.InlineMethodCalls:',f"      methodPattern: {yaml_scalar(s['methodPattern'])}",f"      replacement: {yaml_scalar(s['replacement'])}"]
+            if s['imports']:
+                lines += ['      imports:']+[f"        - {yaml_scalar(x)}" for x in s['imports']]
+            if s['staticImports']:
+                lines += ['      staticImports:']+[f"        - {yaml_scalar(x)}" for x in s['staticImports']]
+    if custom_recipe_name:
+        count+=1
+        lines.append(f'  - {custom_recipe_name}')
+    if count==0: lines.append('  []')
+    return '\n'.join(lines)+'\n', count
+
+
+def java_string(s):
+    return json.dumps(s)
+
+
+def custom_java_source(package, class_name, custom):
+    blocks=[]
+    for idx,op in enumerate(custom):
+        repl=op['replacement']
+        placeholders=PLACEHOLDER_RE.findall(repl)
+        template=PLACEHOLDER_RE.sub('#{any()}',repl)
+        params=[]
+        for ph in placeholders:
+            if ph=='select': params.append('m.getSelect()')
+            else: params.append(f"m.getArguments().get({int(ph[1:])})")
+        imports=op['imports']; statics=op['staticImports']
+        add_imports='\n'.join(f'                    maybeAddImport({java_string(x)});' for x in imports)
+        add_statics='\n'.join(f'                    maybeAddImport({java_string(x.rsplit(".",1)[0])}, {java_string(x.rsplit(".",1)[1])});' for x in statics if '.' in x)
+        builder=f'JavaTemplate.builder({java_string(template)}).contextSensitive()'
+        if imports:
+            builder += '.imports(' + ', '.join(java_string(x) for x in imports) + ')'
+        if statics:
+            builder += '.staticImports(' + ', '.join(java_string(x) for x in statics) + ')'
+        builder += '.build()'
+        param_args = (', ' + ', '.join(params)) if params else ''
+        blocks.append(f'''                if (MATCHER_{idx}.matches(m)) {{\n{add_imports}\n{add_statics}\n                    JavaTemplate t = {builder};\n                    return t.apply(getCursor(), m.getCoordinates().replace(){param_args});\n                }}''')
+    matchers='\n'.join(f'            private final MethodMatcher MATCHER_{i} = new MethodMatcher({java_string(op["methodPattern"])});' for i,op in enumerate(custom))
+    body='\n'.join(blocks)
+    return f'''package {package};\n\nimport org.openrewrite.ExecutionContext;\nimport org.openrewrite.Recipe;\nimport org.openrewrite.TreeVisitor;\nimport org.openrewrite.java.JavaIsoVisitor;\nimport org.openrewrite.java.JavaTemplate;\nimport org.openrewrite.java.MethodMatcher;\nimport org.openrewrite.java.tree.J;\n\npublic class {class_name} extends Recipe {{\n    @Override public String getDisplayName() {{ return "Generated AI dependency migration"; }}\n    @Override public String getDescription() {{ return "Applies validated invocation-level migration templates."; }}\n    @Override public TreeVisitor<?, ExecutionContext> getVisitor() {{\n        return new JavaIsoVisitor<ExecutionContext>() {{\n{matchers}\n            @Override public J.MethodInvocation visitMethodInvocation(J.MethodInvocation method, ExecutionContext ctx) {{\n                J.MethodInvocation m = super.visitMethodInvocation(method, ctx);\n{body}\n                return m;\n            }}\n        }};\n    }}\n}}\n'''
+
+
+def write_custom_module(outdir, custom, recipe_fqcn):
+    if not custom: return None
+    package, cls=recipe_fqcn.rsplit('.',1)
+    module=outdir/'custom-recipe'
+    src=module/'src/main/java'/Path(package.replace('.','/'))
+    src.mkdir(parents=True,exist_ok=True)
+    (src/f'{cls}.java').write_text(custom_java_source(package,cls,custom),encoding='utf-8')
+    pom='''<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.gepardec.renovate</groupId>\n  <artifactId>generated-rewrite-recipe</artifactId>\n  <version>1.0.0</version>\n  <properties><maven.compiler.release>17</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding><rewrite.version>8.91.1</rewrite.version></properties>\n  <dependencies><dependency><groupId>org.openrewrite</groupId><artifactId>rewrite-java</artifactId><version>${rewrite.version}</version></dependency></dependencies>\n</project>\n'''
+    (module/'pom.xml').write_text(pom,encoding='utf-8')
+    return 'com.gepardec.renovate:generated-rewrite-recipe:1.0.0'
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--plan", required=True)
-    parser.add_argument("--recipe", required=True)
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--recipe-name", default="com.gepardec.renovate.GeneratedDependencyMigration")
-    parser.add_argument("--display-name", default="Generated dependency migration")
-    args = parser.parse_args()
-
-    plan_path = Path(args.plan)
-    recipe_path = Path(args.recipe)
-    manifest_path = Path(args.manifest)
-
-    plan = load_json(plan_path)
-    changes = normalize_decisions(plan)
-    recipe_steps = optimize_changes(changes)
-    recipe = render_recipe(args.recipe_name, args.display_name, recipe_steps)
-
-    recipe_path.parent.mkdir(parents=True, exist_ok=True)
-    recipe_path.write_text(recipe, encoding="utf-8")
-
-    plan_sha = hashlib.sha256(plan_path.read_bytes()).hexdigest()
-    recipe_sha = hashlib.sha256(recipe.encode("utf-8")).hexdigest()
-
-    manifest = {
-        "schemaVersion": 2,
-        "generator": "openrewrite-recipe-generator.py",
-        "input": {
-            "path": plan_path.name,
-            "sha256": plan_sha,
-        },
-        "output": {
-            "path": recipe_path.name,
-            "sha256": recipe_sha,
-            "recipeName": args.recipe_name,
-        },
-        "summary": {
-            "inputChangeTypeCount": len(changes),
-            "generatedRecipeStepCount": len(recipe_steps),
-            "changePackageCount": sum(1 for s in recipe_steps if s["transformation"] == "CHANGE_PACKAGE"),
-            "changeTypeCount": sum(1 for s in recipe_steps if s["transformation"] == "CHANGE_TYPE"),
-        },
-        "inputChanges": changes,
-        "recipeSteps": recipe_steps,
+    ap=argparse.ArgumentParser(); ap.add_argument('--plan',required=True); ap.add_argument('--recipe',required=True); ap.add_argument('--manifest',required=True); ap.add_argument('--recipe-name',required=True); ap.add_argument('--display-name',required=True); ap.add_argument('--output-dir',required=True)
+    a=ap.parse_args(); plan=load_json(a.plan); outdir=Path(a.output_dir); outdir.mkdir(parents=True,exist_ok=True)
+    type_steps,builtins,custom=normalize(plan)
+    custom_fqcn='com.gepardec.renovate.generated.GeneratedAiRewriteRecipe' if custom else None
+    coords=write_custom_module(outdir,custom,custom_fqcn) if custom else None
+    recipe, count=render_yaml(a.recipe_name,a.display_name,type_steps,builtins,custom_fqcn)
+    Path(a.recipe).write_text(recipe,encoding='utf-8')
+    manifest={
+      'schemaVersion':3,'generator':'openrewrite-recipe-generator-v3.py',
+      'input':{'path':Path(a.plan).name,'sha256':hashlib.sha256(Path(a.plan).read_bytes()).hexdigest()},
+      'output':{'path':Path(a.recipe).name,'sha256':hashlib.sha256(recipe.encode()).hexdigest(),'recipeName':a.recipe_name},
+      'customRecipe':{'present':bool(custom),'recipeClass':custom_fqcn,'artifactCoordinates':coords,'operationCount':len(custom)},
+      'summary':{'generatedRecipeStepCount':count,'changePackageCount':sum(1 for x in type_steps if x['kind']=='CHANGE_PACKAGE'),'changeTypeCount':sum(1 for x in type_steps if x['kind']=='CHANGE_TYPE'),'builtinRewriteCount':len(builtins),'customJavaTemplateCount':len(custom)},
+      'typeSteps':type_steps,'builtinRewrites':builtins,'customRewrites':custom
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    print(json.dumps(manifest["summary"], sort_keys=True))
-
-
-if __name__ == "__main__":
-    main()
+    Path(a.manifest).write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+    print(json.dumps(manifest['summary'],sort_keys=True))
+if __name__=='__main__': main()

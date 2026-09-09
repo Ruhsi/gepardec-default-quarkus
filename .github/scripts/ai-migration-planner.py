@@ -293,9 +293,22 @@ def build(args):
                         'migrationSteps': {'type': 'array', 'items': {'type': 'string'}},
                         'beforeExample': {'type': ['string', 'null']},
                         'afterExample': {'type': ['string', 'null']},
-                        'automationHint': {'type': 'string', 'enum': ['DETERMINISTIC_RECIPE', 'CUSTOM_RECIPE', 'CODE_TEMPLATE']}
+                        'automationHint': {'type': 'string', 'enum': ['DETERMINISTIC_RECIPE', 'CUSTOM_RECIPE', 'CODE_TEMPLATE']},
+                        'openRewrite': {
+                            'type': ['object', 'null'],
+                            'properties': {
+                                'recipeKind': {'type': 'string', 'enum': ['CHANGE_TYPE', 'CHANGE_PACKAGE', 'CHANGE_METHOD_NAME', 'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE', 'NONE']},
+                                'methodPattern': {'type': ['string', 'null']},
+                                'replacement': {'type': ['string', 'null']},
+                                'newMethodName': {'type': ['string', 'null']},
+                                'imports': {'type': 'array', 'items': {'type': 'string'}},
+                                'staticImports': {'type': 'array', 'items': {'type': 'string'}}
+                            },
+                            'required': ['recipeKind', 'methodPattern', 'replacement', 'newMethodName', 'imports', 'staticImports'],
+                            'additionalProperties': False
+                        }
                     },
-                    'required': ['impactId', 'decision', 'replacementCandidateId', 'transformation', 'confidence', 'rationale', 'solutionTitle', 'solutionDescription', 'targetApi', 'migrationSteps', 'beforeExample', 'afterExample', 'automationHint'],
+                    'required': ['impactId', 'decision', 'replacementCandidateId', 'transformation', 'confidence', 'rationale', 'solutionTitle', 'solutionDescription', 'targetApi', 'migrationSteps', 'beforeExample', 'afterExample', 'automationHint', 'openRewrite'],
                     'additionalProperties': False
                 }
             }
@@ -305,7 +318,7 @@ def build(args):
     }
     (output_dir / 'ai-migration-output-schema.json').write_text(json.dumps(schema, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
-    instructions = '''You are a dependency migration planner. Return exactly one concrete migration solution for every impactId. Never return MANUAL_REVIEW and never leave an impact without a proposed solution. Use supplied replacement candidates whenever they represent the target API. IMPORTANT: choose REPLACE only when you also return a non-null replacementCandidateId from the same impact. If no supplied candidate is a safe one-to-one replacement, choose REWRITE instead and provide a concrete target API and source transformation in solutionDescription, targetApi, migrationSteps, beforeExample, and afterExample. You may use your software-migration knowledge to propose well-known successor APIs for removed APIs, but do not invent Maven coordinates and do not claim that an API exists unless you are reasonably confident. If confidence is limited, still provide the best concrete solution and mark confidence LOW. Never map a symbol to itself. Use NO_SOURCE_CHANGE only when the supplied compatibility evidence clearly shows no source edit is required. Prefer the smallest transformation that restores compatibility. Do not generate an OpenRewrite recipe; describe the migration strategy that Step 7 can translate later.'''
+    instructions = '''You are a dependency migration planner. Return exactly one concrete migration solution for every impactId. Never return MANUAL_REVIEW and never leave an impact without a proposed solution. Use supplied replacement candidates whenever they represent the target API. IMPORTANT: choose REPLACE only when you also return a non-null replacementCandidateId from the same impact. If no supplied candidate is a safe one-to-one replacement, choose REWRITE instead and provide a concrete target API and source transformation in solutionDescription, targetApi, migrationSteps, beforeExample, and afterExample. You may use your software-migration knowledge to propose well-known successor APIs for removed APIs, but do not invent Maven coordinates and do not claim that an API exists unless you are reasonably confident. If confidence is limited, still provide the best concrete solution and mark confidence LOW. Never map a symbol to itself. Use NO_SOURCE_CHANGE only when the supplied compatibility evidence clearly shows no source edit is required. Prefer the smallest transformation that restores compatibility. ALSO return an openRewrite object that is machine-actionable for Step 7. For REPLACE choose CHANGE_TYPE or CHANGE_PACKAGE as appropriate. For REWRITE prefer CHANGE_METHOD_NAME when only the method name changes; otherwise prefer INLINE_METHOD_CALLS when the migration can be expressed as a single method invocation replacement. Use OpenRewrite method pattern syntax such as 'org.hibernate.Session createCriteria(java.lang.Class)' and replacement templates using #{p0}, #{p1}, ... for original arguments. If an invocation-level migration needs a context-sensitive expression, choose CUSTOM_JAVA_TEMPLATE and provide methodPattern plus replacement. Use NONE only with NO_SOURCE_CHANGE. Do not put full Java classes in the openRewrite fields.'''
     (output_dir / 'ai-migration-instructions.txt').write_text(instructions + '\n', encoding='utf-8')
 
     print(json.dumps({'impactCount': len(impacts), 'needsAi': bool(impacts)}, sort_keys=True))
@@ -407,6 +420,27 @@ def validate(args):
         else:
             errors.append(f'{impact_id}: unsupported decision {decision}')
 
+        open_rewrite = d.get('openRewrite')
+        if not isinstance(open_rewrite, dict):
+            errors.append(f'{impact_id}: openRewrite object is required')
+            open_rewrite = {'recipeKind': 'NONE', 'methodPattern': None, 'replacement': None, 'newMethodName': None, 'imports': [], 'staticImports': []}
+        recipe_kind = open_rewrite.get('recipeKind')
+        if decision == 'NO_SOURCE_CHANGE':
+            if recipe_kind != 'NONE':
+                errors.append(f'{impact_id}: NO_SOURCE_CHANGE requires openRewrite.recipeKind NONE')
+        elif decision == 'REPLACE':
+            if recipe_kind not in {'CHANGE_TYPE', 'CHANGE_PACKAGE'}:
+                errors.append(f'{impact_id}: REPLACE requires CHANGE_TYPE or CHANGE_PACKAGE OpenRewrite recipe')
+        elif decision == 'REWRITE':
+            if recipe_kind not in {'CHANGE_METHOD_NAME', 'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'}:
+                errors.append(f'{impact_id}: REWRITE requires CHANGE_METHOD_NAME, INLINE_METHOD_CALLS, or CUSTOM_JAVA_TEMPLATE')
+            if recipe_kind in {'CHANGE_METHOD_NAME', 'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'} and not open_rewrite.get('methodPattern'):
+                errors.append(f'{impact_id}: {recipe_kind} requires openRewrite.methodPattern')
+            if recipe_kind == 'CHANGE_METHOD_NAME' and not open_rewrite.get('newMethodName'):
+                errors.append(f'{impact_id}: CHANGE_METHOD_NAME requires openRewrite.newMethodName')
+            if recipe_kind in {'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'} and not open_rewrite.get('replacement'):
+                errors.append(f'{impact_id}: {recipe_kind} requires openRewrite.replacement')
+
         enriched.append({
             'impactId': impact_id,
             'decision': decision,
@@ -420,6 +454,7 @@ def validate(args):
             'beforeExample': d.get('beforeExample'),
             'afterExample': d.get('afterExample'),
             'automationHint': d.get('automationHint', ''),
+            'openRewrite': open_rewrite,
             'target': impact['target'],
             'replacement': candidate_by_id.get(candidate_id) if candidate_id else None,
             'usages': impact.get('usages', [])
