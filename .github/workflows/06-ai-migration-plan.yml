@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GROQ_MODEL: openai/gpt-oss-120b
+  GEMINI_MODEL: gemini-3.5-flash
   AI_REASONING_EFFORT: medium
   AI_MAX_OUTPUT_TOKENS: "12000"
 
@@ -220,17 +220,17 @@ jobs:
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
-          MODEL: ${{ env.GROQ_MODEL }}
+          MODEL: ${{ env.GEMINI_MODEL }}
           REASONING_EFFORT: ${{ env.AI_REASONING_EFFORT }}
           MAX_OUTPUT_TOKENS: ${{ env.AI_MAX_OUTPUT_TOKENS }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          BATCH_SIZE: "4"
-          MAX_RATE_LIMIT_RETRIES: "8"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          BATCH_SIZE: "20"
+          MAX_RATE_LIMIT_RETRIES: "3"
         run: |
           set -euo pipefail
 
-          if [[ -z "${GROQ_API_KEY:-}" ]]; then
-            echo "::error::Repository secret GROQ_API_KEY is not configured."
+          if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+            echo "::error::Repository secret GEMINI_API_KEY is not configured."
             exit 1
           fi
 
@@ -246,7 +246,7 @@ jobs:
           batch_size = int(os.environ["BATCH_SIZE"])
 
           impacts = evidence.get("impacts", [])
-          batch_dir = out / "groq-batches"
+          batch_dir = out / "gemini-batches"
           batch_dir.mkdir(parents=True, exist_ok=True)
 
           manifest = {
@@ -264,30 +264,22 @@ jobs:
 
               request = {
                   "model": os.environ["MODEL"],
-                  "store": False,
-                  "reasoning": {"effort": os.environ["REASONING_EFFORT"]},
-                  "max_output_tokens": int(os.environ["MAX_OUTPUT_TOKENS"]),
-                  "input": [
-                      {
-                          "role": "developer",
-                          "content": [{"type": "input_text", "text": instructions}],
-                      },
+                  "reasoning_effort": "low",
+                  "messages": [
+                      {"role": "system", "content": instructions},
                       {
                           "role": "user",
-                          "content": [{
-                              "type": "input_text",
-                              "text": "Migration evidence JSON follows. Use only this data.\n"
-                                      + json.dumps(batch_evidence, sort_keys=True),
-                          }],
+                          "content": "Migration evidence JSON follows. Use only this data.\n"
+                                     + json.dumps(batch_evidence, sort_keys=True),
                       },
                   ],
-                  "text": {
-                      "format": {
-                          "type": "json_schema",
+                  "response_format": {
+                      "type": "json_schema",
+                      "json_schema": {
                           "name": "dependency_migration_plan",
                           "strict": True,
                           "schema": schema,
-                      }
+                      },
                   },
               }
 
@@ -301,20 +293,20 @@ jobs:
               })
 
           manifest["batchCount"] = len(manifest["batches"])
-          (out / "groq-batch-manifest.json").write_text(
+          (out / "gemini-batch-manifest.json").write_text(
               json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           PY
 
-          batch_count="$(jq -r '.batchCount' "${OUTPUT_DIR}/groq-batch-manifest.json")"
-          mkdir -p "${OUTPUT_DIR}/groq-batches"
+          batch_count="$(jq -r '.batchCount' "${OUTPUT_DIR}/gemini-batch-manifest.json")"
+          mkdir -p "${OUTPUT_DIR}/gemini-batches"
 
           for batch in $(seq 1 "${batch_count}"); do
             stem="$(printf 'batch-%03d' "${batch}")"
-            request_file="${OUTPUT_DIR}/groq-batches/${stem}-request.json"
-            response_file="${OUTPUT_DIR}/groq-batches/${stem}-response.json"
-            headers_file="${OUTPUT_DIR}/groq-batches/${stem}-headers.txt"
-            raw_file="${OUTPUT_DIR}/groq-batches/${stem}-raw-plan.json"
+            request_file="${OUTPUT_DIR}/gemini-batches/${stem}-request.json"
+            response_file="${OUTPUT_DIR}/gemini-batches/${stem}-response.json"
+            headers_file="${OUTPUT_DIR}/gemini-batches/${stem}-headers.txt"
+            raw_file="${OUTPUT_DIR}/gemini-batches/${stem}-raw-plan.json"
 
             attempt=1
             while true; do
@@ -328,53 +320,41 @@ jobs:
                 --dump-header "${headers_file}" \
                 --write-out '%{http_code}' \
                 --request POST \
-                --header "Authorization: Bearer ${GROQ_API_KEY}" \
+                --header "Authorization: Bearer ${GEMINI_API_KEY}" \
                 --header 'Content-Type: application/json' \
                 --data-binary "@${request_file}" \
-                https://api.groq.com/openai/v1/responses)"
+                https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)"
 
               if [[ "${http_code}" == "200" ]]; then
                 break
               fi
 
-              error_message="$(jq -r '.error.message // .error // "unknown Groq API error"' "${response_file}" 2>/dev/null || true)"
+              error_message="$(jq -r '.error.message // .error // "unknown Gemini API error"' "${response_file}" 2>/dev/null || true)"
 
               if [[ "${http_code}" == "429" && "${attempt}" -le "${MAX_RATE_LIMIT_RETRIES}" ]]; then
                 retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\\r", "", $2); print $2}' "${headers_file}" | tail -1)"
                 if [[ ! "${retry_after}" =~ ^[0-9]+$ ]]; then
-                  retry_after=15
+                  retry_after=10
                 fi
-                echo "Groq rate limit for ${stem}; retrying in ${retry_after}s (attempt ${attempt}/${MAX_RATE_LIMIT_RETRIES})."
+                echo "Gemini rate limit for ${stem}; retrying in ${retry_after}s (attempt ${attempt}/${MAX_RATE_LIMIT_RETRIES})."
+                if [[ "${retry_after}" -gt 60 ]]; then retry_after=60; fi
                 sleep "${retry_after}"
                 attempt=$((attempt + 1))
                 continue
               fi
 
               if [[ "${http_code}" == "413" ]]; then
-                echo "::error::Groq rejected ${stem} as too large even with BATCH_SIZE=${BATCH_SIZE}: ${error_message}"
+                echo "::error::Gemini rejected ${stem} as too large even with BATCH_SIZE=${BATCH_SIZE}: ${error_message}"
               else
-                echo "::error::Groq Responses API returned HTTP ${http_code} for ${stem}: ${error_message}"
+                echo "::error::Gemini Chat Completions API returned HTTP ${http_code} for ${stem}: ${error_message}"
               fi
               exit 1
             done
 
-            status="$(jq -r '.status // ""' "${response_file}")"
-            if [[ "${status}" != "completed" ]]; then
-              echo "::error::Groq response for ${stem} did not complete successfully. status=${status}"
-              jq '{id,status,error,incomplete_details}' "${response_file}" || true
-              exit 1
-            fi
-
-            jq -r '[
-              .output[]?
-              | select(.type == "message")
-              | .content[]?
-              | select(.type == "output_text")
-              | .text
-            ] | join("")' "${response_file}" > "${raw_file}"
+            jq -r '.choices[0].message.content // empty' "${response_file}" > "${raw_file}"
 
             if [[ ! -s "${raw_file}" ]]; then
-              echo "::error::Groq response for ${stem} contained no structured output text."
+              echo "::error::Gemini response for ${stem} contained no structured output text."
               exit 1
             fi
             jq -e . "${raw_file}" >/dev/null
@@ -386,7 +366,7 @@ jobs:
           from pathlib import Path
 
           out = Path(os.environ["OUTPUT_DIR"])
-          manifest = json.loads((out / "groq-batch-manifest.json").read_text(encoding="utf-8"))
+          manifest = json.loads((out / "gemini-batch-manifest.json").read_text(encoding="utf-8"))
           decisions = []
           summaries = []
           responses = []
@@ -394,8 +374,8 @@ jobs:
 
           for entry in manifest["batches"]:
               stem = f"batch-{entry['batch']:03d}"
-              raw = json.loads((out / "groq-batches" / f"{stem}-raw-plan.json").read_text(encoding="utf-8"))
-              response = json.loads((out / "groq-batches" / f"{stem}-response.json").read_text(encoding="utf-8"))
+              raw = json.loads((out / "gemini-batches" / f"{stem}-raw-plan.json").read_text(encoding="utf-8"))
+              response = json.loads((out / "gemini-batches" / f"{stem}-response.json").read_text(encoding="utf-8"))
               batch_decisions = raw.get("decisions", [])
               decisions.extend(batch_decisions)
               if raw.get("summary"):
@@ -408,7 +388,7 @@ jobs:
                   "batch": entry["batch"],
                   "responseId": response.get("id"),
                   "model": response.get("model"),
-                  "status": response.get("status"),
+                  "status": "completed",
                   "usage": usage,
               })
 
@@ -420,8 +400,8 @@ jobs:
               json.dumps(combined, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           metadata = {
-              "provider": "Groq",
-              "endpoint": "Responses API",
+              "provider": "Google Gemini",
+              "endpoint": "OpenAI-compatible Chat Completions API",
               "model": os.environ["MODEL"],
               "store": False,
               "batchSize": int(os.environ["BATCH_SIZE"]),
@@ -440,18 +420,18 @@ jobs:
         env:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
           PLANNER: .github/scripts/ai-migration-planner.py
-          MODEL: ${{ env.GROQ_MODEL }}
+          MODEL: ${{ env.GEMINI_MODEL }}
           REASONING_EFFORT: ${{ env.AI_REASONING_EFFORT }}
           MAX_OUTPUT_TOKENS: ${{ env.AI_MAX_OUTPUT_TOKENS }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          REPAIR_BATCH_SIZE: "2"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REPAIR_BATCH_SIZE: "8"
           MAX_REPAIR_ROUNDS: "3"
-          MAX_RATE_LIMIT_RETRIES: "8"
+          MAX_RATE_LIMIT_RETRIES: "3"
         run: |
           set -euo pipefail
 
-          if [[ -z "${GROQ_API_KEY:-}" ]]; then
-            echo "::error::Repository secret GROQ_API_KEY is not configured."
+          if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+            echo "::error::Repository secret GEMINI_API_KEY is not configured."
             exit 1
           fi
 
@@ -500,7 +480,7 @@ jobs:
           previous_by_id = {d.get("impactId"): d for d in raw_plan.get("decisions", []) if isinstance(d, dict)}
           invalid = check.get("invalidImpacts", [])
 
-          repair_root = out / "groq-repairs" / f"round-{round_no:02d}"
+          repair_root = out / "gemini-repairs" / f"round-{round_no:02d}"
           repair_root.mkdir(parents=True, exist_ok=True)
           manifest = {"round": round_no, "batchSize": batch_size, "invalidImpactCount": len(invalid), "batches": []}
 
@@ -539,14 +519,19 @@ jobs:
 
               request = {
                   "model": os.environ["MODEL"],
-                  "store": False,
-                  "reasoning": {"effort": os.environ["REASONING_EFFORT"]},
-                  "max_output_tokens": int(os.environ["MAX_OUTPUT_TOKENS"]),
-                  "input": [
-                      {"role": "developer", "content": [{"type": "input_text", "text": repair_instructions}]},
-                      {"role": "user", "content": [{"type": "input_text", "text": "Repair evidence JSON follows.\n" + json.dumps(batch_evidence, sort_keys=True)}]},
+                  "reasoning_effort": "low",
+                  "messages": [
+                      {"role": "system", "content": repair_instructions},
+                      {"role": "user", "content": "Repair evidence JSON follows.\n" + json.dumps(batch_evidence, sort_keys=True)},
                   ],
-                  "text": {"format": {"type": "json_schema", "name": "dependency_migration_plan_repair", "strict": True, "schema": schema}},
+                  "response_format": {
+                      "type": "json_schema",
+                      "json_schema": {
+                          "name": "dependency_migration_plan_repair",
+                          "strict": True,
+                          "schema": schema,
+                      },
+                  },
               }
               stem = f"batch-{index:03d}"
               request_path = repair_root / f"{stem}-request.json"
@@ -557,7 +542,7 @@ jobs:
           (repair_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           PY
 
-            repair_root="${OUTPUT_DIR}/groq-repairs/round-$(printf '%02d' "${round}")"
+            repair_root="${OUTPUT_DIR}/gemini-repairs/round-$(printf '%02d' "${round}")"
             batch_count="$(jq -r '.batchCount' "${repair_root}/manifest.json")"
 
             for batch in $(seq 1 "${batch_count}"); do
@@ -579,30 +564,30 @@ jobs:
                   --dump-header "${headers_file}" \
                   --write-out '%{http_code}' \
                   --request POST \
-                  --header "Authorization: Bearer ${GROQ_API_KEY}" \
+                  --header "Authorization: Bearer ${GEMINI_API_KEY}" \
                   --header 'Content-Type: application/json' \
                   --data-binary "@${request_file}" \
-                  https://api.groq.com/openai/v1/responses)"
+                  https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)"
 
                 if [[ "${http_code}" == "200" ]]; then
                   break
                 fi
 
-                error_message="$(jq -r '.error.message // .error // "unknown Groq API error"' "${response_file}" 2>/dev/null || true)"
+                error_message="$(jq -r '.error.message // .error // "unknown Gemini API error"' "${response_file}" 2>/dev/null || true)"
                 if [[ "${http_code}" == "429" && "${attempt}" -le "${MAX_RATE_LIMIT_RETRIES}" ]]; then
                   retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\\r", "", $2); print $2}' "${headers_file}" | tail -1)"
-                  if [[ ! "${retry_after}" =~ ^[0-9]+$ ]]; then retry_after=15; fi
-                  echo "Groq rate limit during repair ${round}/${stem}; retrying in ${retry_after}s."
+                  if [[ ! "${retry_after}" =~ ^[0-9]+$ ]]; then retry_after=10; fi
+                  echo "Gemini rate limit during repair ${round}/${stem}; retrying in ${retry_after}s."
+                  if [[ "${retry_after}" -gt 60 ]]; then retry_after=60; fi
                   sleep "${retry_after}"
                   attempt=$((attempt + 1))
                   continue
                 fi
-                echo "::error::Groq repair request returned HTTP ${http_code}: ${error_message}"
+                echo "::error::Gemini repair request returned HTTP ${http_code}: ${error_message}"
                 exit 1
               done
 
-              jq -r '[.output[]? | select(.type == "message") | .content[]? | select(.type == "output_text") | .text] | join("")' \
-                "${response_file}" > "${raw_file}"
+              jq -r '.choices[0].message.content // empty' "${response_file}" > "${raw_file}"
               jq -e . "${raw_file}" >/dev/null
             done
 
@@ -616,7 +601,7 @@ jobs:
           raw_path = out / "ai-migration-plan-raw.json"
           combined = json.loads(raw_path.read_text(encoding="utf-8"))
           decisions = {d.get("impactId"): d for d in combined.get("decisions", []) if isinstance(d, dict) and d.get("impactId")}
-          repair_root = out / "groq-repairs" / f"round-{round_no:02d}"
+          repair_root = out / "gemini-repairs" / f"round-{round_no:02d}"
           manifest = json.loads((repair_root / "manifest.json").read_text(encoding="utf-8"))
 
           expected = set()
@@ -687,7 +672,7 @@ jobs:
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
-          MODEL: ${{ env.GROQ_MODEL }}
+          MODEL: ${{ env.GEMINI_MODEL }}
         run: |
           set -euo pipefail
 
