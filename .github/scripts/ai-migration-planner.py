@@ -305,7 +305,7 @@ def build(args):
     }
     (output_dir / 'ai-migration-output-schema.json').write_text(json.dumps(schema, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
-    instructions = '''You are a dependency migration planner. Return exactly one concrete migration solution for every impactId. Never return MANUAL_REVIEW and never leave an impact without a proposed solution. Use supplied replacement candidates whenever they represent the target API. For simple symbol replacements, use REPLACE and a replacementCandidateId from the same impact. For complex migrations where no one-to-one candidate exists, use REWRITE and describe a concrete target API and source transformation in solutionDescription, targetApi, migrationSteps, beforeExample, and afterExample. You may use your software-migration knowledge to propose well-known successor APIs for removed APIs, but do not invent Maven coordinates and do not claim that an API exists unless you are reasonably confident. If confidence is limited, still provide the best concrete solution and mark confidence LOW. Never map a symbol to itself. Use NO_SOURCE_CHANGE only when the supplied compatibility evidence clearly shows no source edit is required. Prefer the smallest transformation that restores compatibility. Do not generate an OpenRewrite recipe; describe the migration strategy that Step 7 can translate later.'''
+    instructions = '''You are a dependency migration planner. Return exactly one concrete migration solution for every impactId. Never return MANUAL_REVIEW and never leave an impact without a proposed solution. Use supplied replacement candidates whenever they represent the target API. IMPORTANT: choose REPLACE only when you also return a non-null replacementCandidateId from the same impact. If no supplied candidate is a safe one-to-one replacement, choose REWRITE instead and provide a concrete target API and source transformation in solutionDescription, targetApi, migrationSteps, beforeExample, and afterExample. You may use your software-migration knowledge to propose well-known successor APIs for removed APIs, but do not invent Maven coordinates and do not claim that an API exists unless you are reasonably confident. If confidence is limited, still provide the best concrete solution and mark confidence LOW. Never map a symbol to itself. Use NO_SOURCE_CHANGE only when the supplied compatibility evidence clearly shows no source edit is required. Prefer the smallest transformation that restores compatibility. Do not generate an OpenRewrite recipe; describe the migration strategy that Step 7 can translate later.'''
     (output_dir / 'ai-migration-instructions.txt').write_text(instructions + '\n', encoding='utf-8')
 
     print(json.dumps({'impactCount': len(impacts), 'needsAi': bool(impacts)}, sort_keys=True))
@@ -340,6 +340,34 @@ def validate(args):
         decision = d.get('decision')
         candidate_id = d.get('replacementCandidateId')
         transformation = d.get('transformation')
+
+        # Normalize a common model mistake deterministically before validation:
+        # REPLACE without a candidate id is only safe if exactly one supplied
+        # candidate matches the proposed targetApi. Otherwise this is a REWRITE,
+        # not a one-to-one replacement.
+        if decision == 'REPLACE' and not candidate_id:
+            proposed_targets = {str(x).strip() for x in (d.get('targetApi') or []) if str(x).strip()}
+            matching = [
+                c for c in candidate_by_id.values()
+                if c.get('symbol') in proposed_targets
+            ]
+            if len(matching) == 1:
+                candidate_id = matching[0]['candidateId']
+                d['replacementCandidateId'] = candidate_id
+            elif len(candidate_by_id) == 1:
+                only = next(iter(candidate_by_id.values()))
+                target_symbol = impact.get('target', {}).get('symbol', '')
+                if only.get('symbol') and only.get('symbol') != target_symbol:
+                    candidate_id = only['candidateId']
+                    d['replacementCandidateId'] = candidate_id
+            if not candidate_id:
+                decision = 'REWRITE'
+                d['decision'] = 'REWRITE'
+                d['replacementCandidateId'] = None
+                candidate_id = None
+                if transformation in (None, '', 'CHANGE_TYPE'):
+                    transformation = 'REWRITE_CODE'
+                    d['transformation'] = transformation
 
         if decision == 'REPLACE':
             if not candidate_id:
