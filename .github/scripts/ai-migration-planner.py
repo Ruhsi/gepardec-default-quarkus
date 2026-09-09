@@ -524,6 +524,121 @@ def validate(args):
     (output_dir / 'ai-migration-plan-summary.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
+
+def check_plan(args):
+    input_data = read_json(Path(args.input))
+    raw_plan = read_json(Path(args.raw_plan))
+    impacts = {i['impactId']: i for i in input_data.get('impacts', [])}
+    decisions = raw_plan.get('decisions')
+    report = {
+        'schemaVersion': SCHEMA_VERSION,
+        'valid': False,
+        'expectedImpactCount': len(impacts),
+        'decisionCount': len(decisions) if isinstance(decisions, list) else 0,
+        'invalidImpacts': [],
+        'globalErrors': [],
+    }
+    if not isinstance(decisions, list):
+        report['globalErrors'].append('AI output decisions must be an array')
+        Path(args.report).write_text(json.dumps(report, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        return
+
+    seen = set()
+    invalid = {}
+
+    def add(impact_id, message):
+        invalid.setdefault(impact_id, []).append(message)
+
+    for d in decisions:
+        impact_id = d.get('impactId')
+        if impact_id not in impacts:
+            report['globalErrors'].append(f'Unknown impactId: {impact_id}')
+            continue
+        if impact_id in seen:
+            add(impact_id, f'Duplicate impactId: {impact_id}')
+            continue
+        seen.add(impact_id)
+        impact = impacts[impact_id]
+        candidates = {c['candidateId']: c for c in impact.get('replacementCandidates', [])}
+        decision = d.get('decision')
+        candidate_id = d.get('replacementCandidateId')
+        transformation = d.get('transformation')
+
+        if decision == 'REPLACE':
+            if not candidate_id:
+                add(impact_id, 'REPLACE requires replacementCandidateId')
+            elif candidate_id not in candidates:
+                add(impact_id, f'candidate {candidate_id} is not allowed for this impact')
+            else:
+                repl = candidates[candidate_id].get('symbol', '')
+                old = impact.get('target', {}).get('symbol', '')
+                if repl and old and repl == old:
+                    add(impact_id, f'replacement maps symbol to itself: {old}')
+            if transformation not in impact.get('allowedTransformations', []):
+                add(impact_id, f'transformation {transformation} not allowed for target')
+        elif decision == 'NO_SOURCE_CHANGE':
+            if candidate_id is not None:
+                add(impact_id, 'NO_SOURCE_CHANGE must not have replacementCandidateId')
+            if transformation != 'NO_SOURCE_CHANGE':
+                add(impact_id, 'NO_SOURCE_CHANGE must use NO_SOURCE_CHANGE transformation')
+            target = impact.get('target', {})
+            if target.get('sourceCompatible') is False and target.get('origin') == 'JAPICMP_INCOMPATIBLE_API':
+                add(impact_id, 'source-incompatible JApiCmp target cannot be NO_SOURCE_CHANGE')
+            if target.get('origin') == 'REMOVED_DEPENDENCY_TYPE':
+                add(impact_id, 'removed dependency type cannot be NO_SOURCE_CHANGE')
+        elif decision == 'REWRITE':
+            if candidate_id is not None and candidate_id not in candidates:
+                add(impact_id, f'candidate {candidate_id} is not allowed for this impact')
+            if transformation not in impact.get('allowedTransformations', []):
+                add(impact_id, f'transformation {transformation} not allowed for target')
+            if transformation == 'NO_SOURCE_CHANGE':
+                add(impact_id, 'REWRITE cannot use NO_SOURCE_CHANGE transformation')
+            if not d.get('targetApi'):
+                add(impact_id, 'REWRITE requires at least one targetApi entry')
+            if not d.get('migrationSteps'):
+                add(impact_id, 'REWRITE requires migrationSteps')
+            if not d.get('solutionDescription'):
+                add(impact_id, 'REWRITE requires solutionDescription')
+        else:
+            add(impact_id, f'unsupported decision {decision!r}')
+
+        ow = d.get('openRewrite')
+        if not isinstance(ow, dict):
+            add(impact_id, 'openRewrite object is required')
+            ow = {}
+        kind = ow.get('recipeKind')
+        if decision == 'NO_SOURCE_CHANGE':
+            if kind != 'NONE':
+                add(impact_id, 'NO_SOURCE_CHANGE requires openRewrite.recipeKind NONE')
+        elif decision == 'REPLACE':
+            if kind not in {'CHANGE_TYPE', 'CHANGE_PACKAGE'}:
+                add(impact_id, 'REPLACE requires CHANGE_TYPE or CHANGE_PACKAGE OpenRewrite recipe')
+        elif decision == 'REWRITE':
+            allowed = {'CHANGE_METHOD_NAME', 'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'}
+            if kind not in allowed:
+                add(impact_id, 'REWRITE requires CHANGE_METHOD_NAME, INLINE_METHOD_CALLS, or CUSTOM_JAVA_TEMPLATE')
+            if kind in allowed and not ow.get('methodPattern'):
+                add(impact_id, f'{kind} requires openRewrite.methodPattern')
+            if kind == 'CHANGE_METHOD_NAME' and not ow.get('newMethodName'):
+                add(impact_id, 'CHANGE_METHOD_NAME requires openRewrite.newMethodName')
+            if kind in {'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'} and not ow.get('replacement'):
+                add(impact_id, f'{kind} requires openRewrite.replacement')
+
+    for missing in sorted(set(impacts) - seen):
+        add(missing, 'Missing decision for impactId')
+
+    by_id = {d.get('impactId'): d for d in decisions if isinstance(d, dict) and d.get('impactId')}
+    for impact_id in sorted(invalid):
+        report['invalidImpacts'].append({
+            'impactId': impact_id,
+            'errors': invalid[impact_id],
+            'previousDecision': by_id.get(impact_id),
+        })
+
+    report['valid'] = not report['globalErrors'] and not report['invalidImpacts']
+    Path(args.report).write_text(json.dumps(report, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+
+
 def empty_plan(args):
     input_data = read_json(Path(args.input))
     output_dir = Path(args.output_dir)
@@ -565,6 +680,12 @@ def main():
     v.add_argument('--raw-plan', required=True)
     v.add_argument('--output-dir', required=True)
     v.set_defaults(func=validate)
+
+    c = sub.add_parser('check')
+    c.add_argument('--input', required=True)
+    c.add_argument('--raw-plan', required=True)
+    c.add_argument('--report', required=True)
+    c.set_defaults(func=check_plan)
 
     e = sub.add_parser('empty-plan')
     e.add_argument('--input', required=True)
