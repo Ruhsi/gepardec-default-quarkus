@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GENERATOR_SHA256: "1ddc30214658f248f6ba47efb34e404620a6c05d0812498871406a1c55b191f0"
+      GENERATOR_SHA256: "cd88ef5b24fd94913f0cd863bd7105e383ffcc218af43ed13f52a5def4934cb4"
 
     steps:
       - name: Resolve Step 6 run
