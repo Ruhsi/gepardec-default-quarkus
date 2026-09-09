@@ -228,19 +228,19 @@ def build(args):
 
         if origin == 'REMOVED_DEPENDENCY_TYPE':
             candidates = build_removed_candidates(target, added_index.get('dependencies', []))
-            suggested_transformations = ['CHANGE_TYPE', 'MANUAL_REVIEW']
+            suggested_transformations = ['CHANGE_TYPE', 'CHANGE_PACKAGE', 'REWRITE_CODE']
         elif origin == 'JAPICMP_INCOMPATIBLE_API':
             candidates = build_japicmp_candidates(target, api_changes)
             kind = target.get('kind', '')
             suggested_transformations = {
-                'METHOD': ['CHANGE_METHOD_INVOCATION', 'NO_SOURCE_CHANGE', 'MANUAL_REVIEW'],
-                'CONSTRUCTOR': ['CHANGE_CONSTRUCTOR', 'MANUAL_REVIEW'],
-                'FIELD': ['CHANGE_FIELD', 'MANUAL_REVIEW'],
-                'CLASS': ['CHANGE_TYPE', 'MANUAL_REVIEW']
-            }.get(kind, ['MANUAL_REVIEW'])
+                'METHOD': ['CHANGE_METHOD_INVOCATION', 'REWRITE_CODE', 'NO_SOURCE_CHANGE'],
+                'CONSTRUCTOR': ['CHANGE_CONSTRUCTOR', 'REWRITE_CODE'],
+                'FIELD': ['CHANGE_FIELD', 'REWRITE_CODE'],
+                'CLASS': ['CHANGE_TYPE', 'CHANGE_PACKAGE', 'REWRITE_CODE']
+            }.get(kind, ['REWRITE_CODE'])
         else:
             candidates = []
-            suggested_transformations = ['MANUAL_REVIEW']
+            suggested_transformations = ['REWRITE_CODE']
 
         impacts.append({
             'impactId': impact_id,
@@ -282,13 +282,20 @@ def build(args):
                     'type': 'object',
                     'properties': {
                         'impactId': {'type': 'string'},
-                        'decision': {'type': 'string', 'enum': ['REPLACE', 'NO_SOURCE_CHANGE', 'MANUAL_REVIEW']},
+                        'decision': {'type': 'string', 'enum': ['REPLACE', 'REWRITE', 'NO_SOURCE_CHANGE']},
                         'replacementCandidateId': {'type': ['string', 'null']},
-                        'transformation': {'type': 'string', 'enum': ['CHANGE_TYPE', 'CHANGE_METHOD_INVOCATION', 'CHANGE_CONSTRUCTOR', 'CHANGE_FIELD', 'NO_SOURCE_CHANGE', 'MANUAL_REVIEW']},
+                        'transformation': {'type': 'string', 'enum': ['CHANGE_TYPE', 'CHANGE_PACKAGE', 'CHANGE_METHOD_INVOCATION', 'CHANGE_CONSTRUCTOR', 'CHANGE_FIELD', 'REWRITE_CODE', 'NO_SOURCE_CHANGE']},
                         'confidence': {'type': 'string', 'enum': ['HIGH', 'MEDIUM', 'LOW']},
-                        'rationale': {'type': 'string'}
+                        'rationale': {'type': 'string'},
+                        'solutionTitle': {'type': 'string'},
+                        'solutionDescription': {'type': 'string'},
+                        'targetApi': {'type': 'array', 'items': {'type': 'string'}},
+                        'migrationSteps': {'type': 'array', 'items': {'type': 'string'}},
+                        'beforeExample': {'type': ['string', 'null']},
+                        'afterExample': {'type': ['string', 'null']},
+                        'automationHint': {'type': 'string', 'enum': ['DETERMINISTIC_RECIPE', 'CUSTOM_RECIPE', 'CODE_TEMPLATE']}
                     },
-                    'required': ['impactId', 'decision', 'replacementCandidateId', 'transformation', 'confidence', 'rationale'],
+                    'required': ['impactId', 'decision', 'replacementCandidateId', 'transformation', 'confidence', 'rationale', 'solutionTitle', 'solutionDescription', 'targetApi', 'migrationSteps', 'beforeExample', 'afterExample', 'automationHint'],
                     'additionalProperties': False
                 }
             }
@@ -298,7 +305,7 @@ def build(args):
     }
     (output_dir / 'ai-migration-output-schema.json').write_text(json.dumps(schema, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
-    instructions = '''You are a dependency migration planner. Use only the supplied evidence. Do not invent APIs, Maven coordinates, classes, methods, fields, or constructors. Return exactly one decision for every impactId. A REPLACE decision must use a replacementCandidateId listed under the same impact. Never map a symbol to itself; if no actual replacement is supported by the evidence, return MANUAL_REVIEW. If the evidence is ambiguous or no candidate is sufficient, return MANUAL_REVIEW. For a binary-only incompatibility that does not require a source edit, use NO_SOURCE_CHANGE only when the supplied compatibility evidence supports it. Prefer the smallest source transformation that restores compatibility. Keep rationale concise and evidence-based. Do not generate source code or OpenRewrite recipes.'''
+    instructions = '''You are a dependency migration planner. Return exactly one concrete migration solution for every impactId. Never return MANUAL_REVIEW and never leave an impact without a proposed solution. Use supplied replacement candidates whenever they represent the target API. For simple symbol replacements, use REPLACE and a replacementCandidateId from the same impact. For complex migrations where no one-to-one candidate exists, use REWRITE and describe a concrete target API and source transformation in solutionDescription, targetApi, migrationSteps, beforeExample, and afterExample. You may use your software-migration knowledge to propose well-known successor APIs for removed APIs, but do not invent Maven coordinates and do not claim that an API exists unless you are reasonably confident. If confidence is limited, still provide the best concrete solution and mark confidence LOW. Never map a symbol to itself. Use NO_SOURCE_CHANGE only when the supplied compatibility evidence clearly shows no source edit is required. Prefer the smallest transformation that restores compatibility. Do not generate an OpenRewrite recipe; describe the migration strategy that Step 7 can translate later.'''
     (output_dir / 'ai-migration-instructions.txt').write_text(instructions + '\n', encoding='utf-8')
 
     print(json.dumps({'impactCount': len(impacts), 'needsAi': bool(impacts)}, sort_keys=True))
@@ -356,11 +363,19 @@ def validate(args):
                 errors.append(f'{impact_id}: source-incompatible JApiCmp target cannot be NO_SOURCE_CHANGE')
             if target.get('origin') == 'REMOVED_DEPENDENCY_TYPE':
                 errors.append(f'{impact_id}: removed dependency type cannot be NO_SOURCE_CHANGE')
-        elif decision == 'MANUAL_REVIEW':
-            if candidate_id is not None:
-                errors.append(f'{impact_id}: MANUAL_REVIEW must not have replacementCandidateId')
-            if transformation != 'MANUAL_REVIEW':
-                errors.append(f'{impact_id}: MANUAL_REVIEW must use MANUAL_REVIEW transformation')
+        elif decision == 'REWRITE':
+            if candidate_id is not None and candidate_id not in candidate_by_id:
+                errors.append(f'{impact_id}: candidate {candidate_id} is not allowed for this impact')
+            if transformation not in impact.get('allowedTransformations', []):
+                errors.append(f'{impact_id}: transformation {transformation} not allowed for target')
+            if transformation == 'NO_SOURCE_CHANGE':
+                errors.append(f'{impact_id}: REWRITE cannot use NO_SOURCE_CHANGE transformation')
+            if not d.get('targetApi'):
+                errors.append(f'{impact_id}: REWRITE requires at least one targetApi entry')
+            if not d.get('migrationSteps'):
+                errors.append(f'{impact_id}: REWRITE requires migrationSteps')
+            if not d.get('solutionDescription'):
+                errors.append(f'{impact_id}: REWRITE requires solutionDescription')
         else:
             errors.append(f'{impact_id}: unsupported decision {decision}')
 
@@ -370,6 +385,13 @@ def validate(args):
             'transformation': transformation,
             'confidence': d.get('confidence'),
             'rationale': d.get('rationale', ''),
+            'solutionTitle': d.get('solutionTitle', ''),
+            'solutionDescription': d.get('solutionDescription', ''),
+            'targetApi': d.get('targetApi', []),
+            'migrationSteps': d.get('migrationSteps', []),
+            'beforeExample': d.get('beforeExample'),
+            'afterExample': d.get('afterExample'),
+            'automationHint': d.get('automationHint', ''),
             'target': impact['target'],
             'replacement': candidate_by_id.get(candidate_id) if candidate_id else None,
             'usages': impact.get('usages', [])
@@ -414,7 +436,7 @@ def validate(args):
             'impactCount': len(enriched),
             'replaceCount': summary_counts['REPLACE'],
             'noSourceChangeCount': summary_counts['NO_SOURCE_CHANGE'],
-            'manualReviewCount': summary_counts['MANUAL_REVIEW'],
+            'rewriteCount': summary_counts['REWRITE'],
             'affectedSourceFileCount': len(affected_files),
             'confidenceCounts': dict(sorted(confidence_counts.items()))
         },
@@ -427,7 +449,7 @@ def validate(args):
         f"- Impacts: {len(enriched)}",
         f"- Replacements: {summary_counts['REPLACE']}",
         f"- No source change: {summary_counts['NO_SOURCE_CHANGE']}",
-        f"- Manual review: {summary_counts['MANUAL_REVIEW']}",
+        f"- Complex rewrites: {summary_counts['REWRITE']}",
         f"- Affected source files: {len(affected_files)}", '',
         '| Source target | Decision | Replacement | Transformation | Confidence |',
         '|---|---|---|---|---|'
@@ -455,7 +477,7 @@ def empty_plan(args):
             'impactCount': 0,
             'replaceCount': 0,
             'noSourceChangeCount': 0,
-            'manualReviewCount': 0,
+            'rewriteCount': 0,
             'affectedSourceFileCount': 0,
             'confidenceCounts': {}
         },
