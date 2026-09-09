@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import re
 import sys
 from collections import defaultdict
 from difflib import SequenceMatcher
@@ -29,6 +30,34 @@ def stable_id(prefix: str, *parts: str) -> str:
     raw = '\0'.join(str(p) for p in parts).encode('utf-8')
     return f"{prefix}-{hashlib.sha256(raw).hexdigest()[:20]}"
 
+
+
+def method_pattern_arity(method_pattern: str):
+    """Return exact argument count for an OpenRewrite method pattern, or None for wildcard/unknown."""
+    if not method_pattern or '(' not in method_pattern or ')' not in method_pattern:
+        return None
+    args = method_pattern.rsplit('(', 1)[1].split(')', 1)[0].strip()
+    if args == '':
+        return 0
+    if '..' in args:
+        return None
+    return len([part for part in args.split(',') if part.strip()])
+
+
+def replacement_placeholder_errors(method_pattern: str, replacement: str):
+    if not replacement:
+        return []
+    arity = method_pattern_arity(method_pattern)
+    if arity is None:
+        return []
+    indexes = sorted({int(m.group(1)) for m in re.finditer(r'#\{p(\d+)\}', replacement)})
+    errors = []
+    for index in indexes:
+        if index >= arity:
+            errors.append(
+                f'replacement references #{{p{index}}}, but methodPattern declares {arity} parameter(s)'
+            )
+    return errors
 
 def package_name(fqcn: str) -> str:
     return fqcn.rsplit('.', 1)[0] if '.' in fqcn else ''
@@ -318,7 +347,7 @@ def build(args):
     }
     (output_dir / 'ai-migration-output-schema.json').write_text(json.dumps(schema, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
-    instructions = '''You are a dependency migration planner. Return exactly one concrete migration solution for every impactId. Never return MANUAL_REVIEW and never leave an impact without a proposed solution. Use supplied replacement candidates whenever they represent the target API. IMPORTANT: choose REPLACE only when you also return a non-null replacementCandidateId from the same impact. If no supplied candidate is a safe one-to-one replacement, choose REWRITE instead and provide a concrete target API and source transformation in solutionDescription, targetApi, migrationSteps, beforeExample, and afterExample. You may use your software-migration knowledge to propose well-known successor APIs for removed APIs, but do not invent Maven coordinates and do not claim that an API exists unless you are reasonably confident. If confidence is limited, still provide the best concrete solution and mark confidence LOW. Never map a symbol to itself. Use NO_SOURCE_CHANGE only when the supplied compatibility evidence clearly shows no source edit is required. Prefer the smallest transformation that restores compatibility. ALSO return an openRewrite object that is machine-actionable for Step 7. For REPLACE choose CHANGE_TYPE or CHANGE_PACKAGE as appropriate. For REWRITE prefer CHANGE_METHOD_NAME when only the method name changes; otherwise prefer INLINE_METHOD_CALLS when the migration can be expressed as a single method invocation replacement. Use OpenRewrite method pattern syntax such as 'org.hibernate.Session createCriteria(java.lang.Class)' and replacement templates using #{p0}, #{p1}, ... for original arguments. If an invocation-level migration needs a context-sensitive expression, choose CUSTOM_JAVA_TEMPLATE and provide methodPattern plus replacement. Use NONE only with NO_SOURCE_CHANGE. Do not put full Java classes in the openRewrite fields.'''
+    instructions = '''You are a dependency migration planner. Return exactly one concrete migration solution for every impactId. Never return MANUAL_REVIEW and never leave an impact without a proposed solution. Use supplied replacement candidates whenever they represent the target API. IMPORTANT: choose REPLACE only when you also return a non-null replacementCandidateId from the same impact. If no supplied candidate is a safe one-to-one replacement, choose REWRITE instead and provide a concrete target API and source transformation in solutionDescription, targetApi, migrationSteps, beforeExample, and afterExample. You may use your software-migration knowledge to propose well-known successor APIs for removed APIs, but do not invent Maven coordinates and do not claim that an API exists unless you are reasonably confident. If confidence is limited, still provide the best concrete solution and mark confidence LOW. Never map a symbol to itself. Use NO_SOURCE_CHANGE only when the supplied compatibility evidence clearly shows no source edit is required. Prefer the smallest transformation that restores compatibility. ALSO return an openRewrite object that is machine-actionable for Step 7. For REPLACE choose CHANGE_TYPE or CHANGE_PACKAGE as appropriate. For REWRITE prefer CHANGE_METHOD_NAME when only the method name changes; otherwise prefer INLINE_METHOD_CALLS when the migration can be expressed as a single method invocation replacement. Use OpenRewrite method pattern syntax such as 'org.hibernate.Session createCriteria(java.lang.Class)' and replacement templates using #{p0}, #{p1}, ... only for arguments actually declared by that exact method pattern. For a zero-argument pattern ending in (), do not reference any #{pN}. For a pattern with two explicit parameters, only #{p0} and #{p1} are valid. If an invocation-level migration needs a context-sensitive expression, choose CUSTOM_JAVA_TEMPLATE and provide methodPattern plus replacement. Use NONE only with NO_SOURCE_CHANGE. Do not put full Java classes in the openRewrite fields.'''
     (output_dir / 'ai-migration-instructions.txt').write_text(instructions + '\n', encoding='utf-8')
 
     print(json.dumps({'impactCount': len(impacts), 'needsAi': bool(impacts)}, sort_keys=True))
@@ -440,6 +469,9 @@ def validate(args):
                 errors.append(f'{impact_id}: CHANGE_METHOD_NAME requires openRewrite.newMethodName')
             if recipe_kind in {'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'} and not open_rewrite.get('replacement'):
                 errors.append(f'{impact_id}: {recipe_kind} requires openRewrite.replacement')
+            if recipe_kind in {'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'} and open_rewrite.get('methodPattern') and open_rewrite.get('replacement'):
+                for placeholder_error in replacement_placeholder_errors(open_rewrite.get('methodPattern'), open_rewrite.get('replacement')):
+                    errors.append(f'{impact_id}: {recipe_kind} {placeholder_error}')
 
         enriched.append({
             'impactId': impact_id,
@@ -623,6 +655,9 @@ def check_plan(args):
                 add(impact_id, 'CHANGE_METHOD_NAME requires openRewrite.newMethodName')
             if kind in {'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'} and not ow.get('replacement'):
                 add(impact_id, f'{kind} requires openRewrite.replacement')
+            if kind in {'INLINE_METHOD_CALLS', 'CUSTOM_JAVA_TEMPLATE'} and ow.get('methodPattern') and ow.get('replacement'):
+                for placeholder_error in replacement_placeholder_errors(ow.get('methodPattern'), ow.get('replacement')):
+                    add(impact_id, f'{kind} {placeholder_error}')
 
     for missing in sorted(set(impacts) - seen):
         add(missing, 'Missing decision for impactId')
