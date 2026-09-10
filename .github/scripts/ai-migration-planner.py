@@ -598,14 +598,9 @@ def validate_plan_structure(input_data, raw_plan):
             impact = impacts.get(impact_id, {})
             usage_kinds = {u.get('usageKind') for u in impact.get('usages', []) if u.get('usageKind')}
             if kind == 'REMOVE_IMPORT':
-                # One impact represents one affected API symbol and may contain both the
-                # import and executable usages of that symbol. Removing the import is
-                # therefore valid as one part of a coordinated rewrite as long as this
-                # impact actually contains a TYPE_IMPORT usage. Other usages are handled
-                # by separate rewrite units referenced by the same decision.
-                if 'TYPE_IMPORT' not in usage_kinds:
+                if not usage_kinds or usage_kinds - {'TYPE_IMPORT'}:
                     errors_by_impact[impact_id].append(
-                        f'rewriteUnit {unit_id} REMOVE_IMPORT requires a TYPE_IMPORT usage for the covered impact'
+                        f'rewriteUnit {unit_id} REMOVE_IMPORT may only cover an impact whose usages are exclusively TYPE_IMPORT'
                     )
                 target_symbol = (impact.get('target') or {}).get('symbol', '')
                 if target_symbol and unit.get('typeName') != target_symbol:
