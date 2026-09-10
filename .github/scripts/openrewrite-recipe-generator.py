@@ -26,6 +26,20 @@ def java_string(value):
     return json.dumps(value, ensure_ascii=False)
 
 
+def exact_method_pattern(pattern):
+    if not isinstance(pattern, str) or '(' not in pattern:
+        return False
+    left = pattern.split('(', 1)[0].strip()
+    if ' ' not in left:
+        return False
+    declaring_type, method_name = left.rsplit(' ', 1)
+    if not FQCN_RE.match(declaring_type):
+        return False
+    if not re.match(r'^[A-Za-z_$][A-Za-z0-9_$]*$', method_name):
+        return False
+    return True
+
+
 def normalize(plan):
     decisions = plan.get('decisions')
     units = plan.get('rewriteUnits')
@@ -80,6 +94,13 @@ def normalize(plan):
         else:
             fail(f'{impact_id}: REPLACE requires explicit CHANGE_TYPE or CHANGE_PACKAGE transformation')
 
+    decision_by_id = {d.get('impactId'): d for d in decisions if isinstance(d, dict) and d.get('impactId')}
+    executable_usage_kinds = {
+        'METHOD_INVOCATION', 'METHOD_REFERENCE', 'METHOD_OVERRIDE',
+        'CONSTRUCTOR_CALL', 'CONSTRUCTOR_REFERENCE', 'CONSTRUCTOR_INVOCATION',
+        'FIELD_ACCESS', 'LAMBDA_IMPLEMENTATION',
+    }
+
     normalized_units = []
     seen_units = set()
     for unit in units:
@@ -88,10 +109,12 @@ def normalize(plan):
         if not unit_id or unit_id in seen_units:
             fail(f'duplicate or missing rewrite unitId {unit_id!r}')
         seen_units.add(unit_id)
-        if kind not in {'CHANGE_METHOD_NAME', 'INLINE_METHOD_CALLS', 'CUSTOM_EXPRESSION_TEMPLATE', 'REPLACE_METHOD_BODY'}:
+        if kind not in {'CHANGE_METHOD_NAME', 'INLINE_METHOD_CALLS', 'CUSTOM_EXPRESSION_TEMPLATE', 'REPLACE_METHOD_BODY', 'REMOVE_IMPORT'}:
             fail(f'{unit_id}: unsupported rewrite unit recipeKind {kind!r}')
-        if not unit.get('methodPattern'):
+        if kind != 'REMOVE_IMPORT' and not unit.get('methodPattern'):
             fail(f'{unit_id}: methodPattern is required')
+        if kind != 'REMOVE_IMPORT' and not exact_method_pattern(unit.get('methodPattern')):
+            fail(f'{unit_id}: methodPattern must identify one exact fully-qualified declaring type and method name')
         item = {
             'unitId': unit_id,
             'coversImpactIds': sorted(set(unit.get('coversImpactIds') or [])),
@@ -101,11 +124,37 @@ def normalize(plan):
             'newMethodName': unit.get('newMethodName'),
             'imports': sorted(set(unit.get('imports') or [])),
             'staticImports': sorted(set(unit.get('staticImports') or [])),
+            'typeName': unit.get('typeName'),
         }
         if kind == 'CHANGE_METHOD_NAME' and not item['newMethodName']:
             fail(f'{unit_id}: CHANGE_METHOD_NAME requires newMethodName')
         if kind in {'INLINE_METHOD_CALLS', 'CUSTOM_EXPRESSION_TEMPLATE', 'REPLACE_METHOD_BODY'} and not item['replacement']:
             fail(f'{unit_id}: {kind} requires replacement')
+        if kind == 'REMOVE_IMPORT':
+            if item['methodPattern'] not in (None, ''):
+                fail(f'{unit_id}: REMOVE_IMPORT methodPattern must be null or empty')
+            if not isinstance(item['typeName'], str) or not FQCN_RE.match(item['typeName']):
+                fail(f'{unit_id}: REMOVE_IMPORT requires fully-qualified typeName')
+            if item['replacement'] is not None or item['newMethodName'] is not None:
+                fail(f'{unit_id}: REMOVE_IMPORT must not define replacement or newMethodName')
+
+        for impact_id in item['coversImpactIds']:
+            decision = decision_by_id.get(impact_id)
+            if not decision:
+                fail(f'{unit_id}: covers unknown impactId {impact_id}')
+            usage_kinds = {
+                u.get('usageKind') for u in (decision.get('usages') or [])
+                if isinstance(u, dict) and u.get('usageKind')
+            }
+            if kind == 'REMOVE_IMPORT':
+                if not usage_kinds or usage_kinds - {'TYPE_IMPORT'}:
+                    fail(f'{unit_id}: REMOVE_IMPORT may only cover TYPE_IMPORT-only impacts, got {sorted(usage_kinds)}')
+                target_symbol = (decision.get('target') or {}).get('symbol')
+                if target_symbol and item['typeName'] != target_symbol:
+                    fail(f'{unit_id}: REMOVE_IMPORT typeName {item["typeName"]} does not match covered target {target_symbol}')
+            elif kind in {'CHANGE_METHOD_NAME', 'INLINE_METHOD_CALLS', 'CUSTOM_EXPRESSION_TEMPLATE'}:
+                if not (usage_kinds & executable_usage_kinds):
+                    fail(f'{unit_id}: {kind} requires executable/member usage evidence, got {sorted(usage_kinds)}')
         normalized_units.append(item)
 
     normalized_units.sort(key=lambda x: x['unitId'])
@@ -191,7 +240,7 @@ def java_template_builder(replacement, imports, static_imports):
     return builder, parameters
 
 
-def custom_java_source(package, class_name, custom_expression_units, method_body_units):
+def custom_java_source(package, class_name, custom_expression_units, method_body_units, remove_import_units):
     matcher_fields = []
     expr_blocks = []
     body_blocks = []
@@ -205,8 +254,11 @@ def custom_java_source(package, class_name, custom_expression_units, method_body
             for value in unit['staticImports'] if '.' in value
         )
         param_args = ', ' + ', '.join(params) if params else ''
+        select_guard = ''
+        if '#{select}' in unit['replacement']:
+            select_guard = '                    if (m.getSelect() == null) { return m; }\n'
         expr_blocks.append(f'''                if (EXPR_MATCHER_{index}.matches(m)) {{
-{add_imports}
+{select_guard}{add_imports}
 {add_static}
                     JavaTemplate template = {builder};
                     return template.apply(getCursor(), m.getCoordinates().replace(){param_args});
@@ -263,6 +315,19 @@ def custom_java_source(package, class_name, custom_expression_units, method_body
                 return super.visitMethodDeclaration(method, ctx);
             }}
 '''
+    import_override = ''
+    if remove_import_units:
+        removals = '\n'.join(
+            f'                maybeRemoveImport({java_string(unit["typeName"])});'
+            for unit in remove_import_units
+        )
+        import_override = f'''
+            @Override
+            public J visitCompilationUnit(J.CompilationUnit compilationUnit, ExecutionContext ctx) {{
+{removals}
+                return super.visitCompilationUnit(compilationUnit, ctx);
+            }}
+'''
 
     return f'''package {package};
 
@@ -282,7 +347,7 @@ public class {class_name} extends Recipe {{
 
     @Override
     public String getDescription() {{
-        return "Applies validated expression and method-body migration templates.";
+        return "Applies validated import, expression, and method-body migration operations.";
     }}
 
     @Override
@@ -291,6 +356,7 @@ public class {class_name} extends Recipe {{
 {fields}
 {expression_override}
 {body_override}
+{import_override}
         }};
     }}
 }}
@@ -300,13 +366,14 @@ public class {class_name} extends Recipe {{
 def write_custom_module(outdir, units, recipe_fqcn):
     expressions = [u for u in units if u['kind'] == 'CUSTOM_EXPRESSION_TEMPLATE']
     bodies = [u for u in units if u['kind'] == 'REPLACE_METHOD_BODY']
-    if not expressions and not bodies:
+    remove_imports = [u for u in units if u['kind'] == 'REMOVE_IMPORT']
+    if not expressions and not bodies and not remove_imports:
         return None
     package, class_name = recipe_fqcn.rsplit('.', 1)
     module = outdir / 'custom-recipe'
     src_dir = module / 'src/main/java' / Path(package.replace('.', '/'))
     src_dir.mkdir(parents=True, exist_ok=True)
-    source = custom_java_source(package, class_name, expressions, bodies)
+    source = custom_java_source(package, class_name, expressions, bodies, remove_imports)
     (src_dir / f'{class_name}.java').write_text(source, encoding='utf-8')
     pom = '''<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
@@ -347,15 +414,15 @@ def main():
     plan = load_json(plan_path)
     type_steps, units = normalize(plan)
 
-    custom_units = [u for u in units if u['kind'] in {'CUSTOM_EXPRESSION_TEMPLATE', 'REPLACE_METHOD_BODY'}]
+    custom_units = [u for u in units if u['kind'] in {'CUSTOM_EXPRESSION_TEMPLATE', 'REPLACE_METHOD_BODY', 'REMOVE_IMPORT'}]
     custom_fqcn = 'com.gepardec.renovate.generated.GeneratedAiRewriteRecipe' if custom_units else None
     coordinates = write_custom_module(outdir, units, custom_fqcn) if custom_fqcn else None
     recipe, step_count = render_yaml(args.recipe_name, args.display_name, type_steps, units, custom_fqcn)
     Path(args.recipe).write_text(recipe, encoding='utf-8')
 
     manifest = {
-        'schemaVersion': 4,
-        'generator': 'openrewrite-recipe-generator-v15.py',
+        'schemaVersion': 5,
+        'generator': 'openrewrite-recipe-generator-v16.py',
         'input': {'path': plan_path.name, 'sha256': hashlib.sha256(plan_path.read_bytes()).hexdigest()},
         'output': {'path': Path(args.recipe).name, 'sha256': hashlib.sha256(recipe.encode()).hexdigest(), 'recipeName': args.recipe_name},
         'customRecipe': {
@@ -372,6 +439,7 @@ def main():
             'inlineMethodCallsCount': sum(1 for x in units if x['kind'] == 'INLINE_METHOD_CALLS'),
             'customExpressionCount': sum(1 for x in units if x['kind'] == 'CUSTOM_EXPRESSION_TEMPLATE'),
             'methodBodyRewriteCount': sum(1 for x in units if x['kind'] == 'REPLACE_METHOD_BODY'),
+            'removeImportCount': sum(1 for x in units if x['kind'] == 'REMOVE_IMPORT'),
             'removeUnusedImportsIncluded': bool(step_count),
         },
         'typeSteps': type_steps,

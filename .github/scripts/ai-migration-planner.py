@@ -8,7 +8,7 @@ from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FQCN_RE = re.compile(r'^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$')
 PLACEHOLDER_RE = re.compile(r'#\{p(\d+)\}')
 REWRITE_UNIT_KINDS = {
@@ -16,6 +16,7 @@ REWRITE_UNIT_KINDS = {
     'INLINE_METHOD_CALLS',
     'CUSTOM_EXPRESSION_TEMPLATE',
     'REPLACE_METHOD_BODY',
+    'REMOVE_IMPORT',
 }
 
 
@@ -193,6 +194,16 @@ def enclosing_method_parts(enclosing_method: str):
     return declaring_type or None, method_name or None
 
 
+def exact_method_pattern(pattern: str):
+    if not isinstance(pattern, str) or '(' not in pattern:
+        return False
+    left = pattern.split('(', 1)[0].strip()
+    if ' ' not in left:
+        return False
+    declaring_type, method_name = left.rsplit(' ', 1)
+    return bool(FQCN_RE.match(declaring_type) and re.match(r'^[A-Za-z_$][A-Za-z0-9_$]*$', method_name))
+
+
 def method_pattern_arity(pattern: str):
     if not pattern or '(' not in pattern or ')' not in pattern:
         return None
@@ -262,8 +273,9 @@ def output_schema():
             'newMethodName': {'type': ['string', 'null']},
             'imports': {'type': 'array', 'items': {'type': 'string'}},
             'staticImports': {'type': 'array', 'items': {'type': 'string'}},
+            'typeName': {'type': ['string', 'null']},
         },
-        'required': ['unitId', 'coversImpactIds', 'recipeKind', 'methodPattern', 'replacement', 'newMethodName', 'imports', 'staticImports'],
+        'required': ['unitId', 'coversImpactIds', 'recipeKind', 'methodPattern', 'replacement', 'newMethodName', 'imports', 'staticImports', 'typeName'],
         'additionalProperties': False,
     }
     return {
@@ -412,13 +424,13 @@ RULES:
 4. NO_SOURCE_CHANGE is only valid when the supplied compatibility evidence and source usage show that no source edit is required.
 5. REWRITE is for source transformations without a safe one-to-one type/package candidate. Every REWRITE decision must reference one or more rewriteUnitIds.
 6. rewriteUnits are shared transformation units. One unit may cover multiple impacts and one impact may reference multiple units.
-7. Use CHANGE_METHOD_NAME only for a pure method rename. Use INLINE_METHOD_CALLS only when one invocation can be replaced independently while preserving expression semantics. Use CUSTOM_EXPRESSION_TEMPLATE only for one expression replacement. Use REPLACE_METHOD_BODY when a migration requires coordinated changes to multiple statements, variables, chained calls, control/data flow, or several impacted APIs in the same application method.
+7. Use REMOVE_IMPORT when an affected removed type is only present as an obsolete import and has no remaining non-import source usage. Use CHANGE_METHOD_NAME only for a pure method rename. Use INLINE_METHOD_CALLS only when one invocation can be replaced independently while preserving expression semantics. Use CUSTOM_EXPRESSION_TEMPLATE only for one executable expression replacement. Use REPLACE_METHOD_BODY when a migration requires coordinated changes to multiple statements, variables, chained calls, control/data flow, or several impacted APIs in the same application method.
 8. Inspect sourceMethodGroups before selecting rewrite granularity. Multiple impacts in the same method are not automatically coupled, but if independent rewrites could create inconsistent intermediate code, change types used by later calls, lose behavior, or require coordinated local variables/statements, create one shared REPLACE_METHOD_BODY unit covering all relevant impacts for that application method.
 9. For REPLACE_METHOD_BODY, methodPattern must match the APPLICATION method declaration, not the dependency API being removed or changed. replacement is the complete new body content WITHOUT outer braces. Preserve observable behavior, parameters, return behavior, ordering, error handling, limits, state changes, and transaction/resource semantics visible in the source.
 10. sourceContexts contains exact PR-HEAD source text when available. Base all code templates on actual names and structures from that source; do not invent fields or local variables that are not introduced by your replacement.
-11. methodPattern uses OpenRewrite MethodMatcher syntax: fully.qualified.DeclaringType methodName(argument.Types).
+11. methodPattern uses OpenRewrite MethodMatcher syntax: fully.qualified.DeclaringType methodName(argument.Types). It is required for method/expression/body rewrite units and must be null or empty for REMOVE_IMPORT. REMOVE_IMPORT requires typeName to be the exact fully-qualified imported type.
 12. REPLACE_METHOD_BODY replacement contains body statements only, without surrounding { } and without #{pN} placeholders. It may refer directly to parameters/fields visible in that application method and may declare required locals.
-13. For INLINE_METHOD_CALLS and CUSTOM_EXPRESSION_TEMPLATE, #{p0}, #{p1}, ... refer to invocation arguments and must respect methodPattern arity. CUSTOM_EXPRESSION_TEMPLATE may also use #{select} for the invocation select.
+13. For INLINE_METHOD_CALLS and CUSTOM_EXPRESSION_TEMPLATE, #{p0}, #{p1}, ... refer to invocation arguments and must respect methodPattern arity. CUSTOM_EXPRESSION_TEMPLATE may also use #{select} for the invocation receiver/select, but only for an actual method/constructor expression impact. Never use an expression template to remove an import.
 14. imports/staticImports must list every non-java.lang type introduced by a template that is not already fully qualified. Keep them minimal.
 15. This step plans source migration only. Do not invent or add Maven dependencies. If the supplied evidence cannot support a dependency change, solve the source migration using APIs available after the dependency update.
 16. Prefer deterministic OpenRewrite built-ins over custom templates when they fully express the migration. Prefer the smallest safe rewrite granularity: type/package, then method rename/inline expression, then custom expression, then full method body.
@@ -502,8 +514,16 @@ def validate_plan_structure(input_data, raw_plan):
         kind = unit.get('recipeKind')
         if kind not in REWRITE_UNIT_KINDS:
             global_errors.append(f'{unit_id}: unsupported recipeKind {kind!r}')
-        if not unit.get('methodPattern'):
+        if kind == 'REMOVE_IMPORT':
+            if unit.get('methodPattern') not in (None, ''):
+                global_errors.append(f'{unit_id}: REMOVE_IMPORT methodPattern must be null or empty')
+            type_name = unit.get('typeName')
+            if not isinstance(type_name, str) or not FQCN_RE.match(type_name):
+                global_errors.append(f'{unit_id}: REMOVE_IMPORT requires fully-qualified typeName')
+        elif not unit.get('methodPattern'):
             global_errors.append(f'{unit_id}: methodPattern is required')
+        elif not exact_method_pattern(unit.get('methodPattern')):
+            global_errors.append(f'{unit_id}: methodPattern must identify one exact fully-qualified declaring type and method name')
         elif kind == 'REPLACE_METHOD_BODY':
             pattern = unit.get('methodPattern')
             if pattern in method_body_patterns:
@@ -540,6 +560,15 @@ def validate_plan_structure(input_data, raw_plan):
                 global_errors.append(f'{unit_id}: REPLACE_METHOD_BODY must not use #{{pN}} placeholders')
             if unit.get('newMethodName') is not None:
                 global_errors.append(f'{unit_id}: REPLACE_METHOD_BODY newMethodName must be null')
+        elif kind == 'REMOVE_IMPORT':
+            if unit.get('replacement') is not None:
+                global_errors.append(f'{unit_id}: REMOVE_IMPORT replacement must be null')
+            if unit.get('newMethodName') is not None:
+                global_errors.append(f'{unit_id}: REMOVE_IMPORT newMethodName must be null')
+            if unit.get('imports'):
+                global_errors.append(f'{unit_id}: REMOVE_IMPORT imports must be empty')
+            if unit.get('staticImports'):
+                global_errors.append(f'{unit_id}: REMOVE_IMPORT staticImports must be empty')
 
         # Generic structural validation: a method-body unit may only claim impacts
         # that actually occur inside the application method targeted by the unit.
@@ -556,6 +585,32 @@ def validate_plan_structure(input_data, raw_plan):
                     errors_by_impact[impact_id].append(
                         f'rewriteUnit {unit_id} targets {pattern_type}#{pattern_name}, '
                         'but this impact has no usage in that application method'
+                    )
+
+        # Generic coverage/type guard: import-only impacts must be handled as imports,
+        # while executable templates must be backed by executable source usages.
+        executable_usage_kinds = {
+            'METHOD_INVOCATION', 'METHOD_REFERENCE', 'METHOD_OVERRIDE',
+            'CONSTRUCTOR_CALL', 'CONSTRUCTOR_REFERENCE', 'CONSTRUCTOR_INVOCATION',
+            'FIELD_ACCESS', 'LAMBDA_IMPLEMENTATION',
+        }
+        for impact_id in covers:
+            impact = impacts.get(impact_id, {})
+            usage_kinds = {u.get('usageKind') for u in impact.get('usages', []) if u.get('usageKind')}
+            if kind == 'REMOVE_IMPORT':
+                if not usage_kinds or usage_kinds - {'TYPE_IMPORT'}:
+                    errors_by_impact[impact_id].append(
+                        f'rewriteUnit {unit_id} REMOVE_IMPORT may only cover an impact whose usages are exclusively TYPE_IMPORT'
+                    )
+                target_symbol = (impact.get('target') or {}).get('symbol', '')
+                if target_symbol and unit.get('typeName') != target_symbol:
+                    errors_by_impact[impact_id].append(
+                        f'rewriteUnit {unit_id} REMOVE_IMPORT typeName must equal affected type {target_symbol}'
+                    )
+            elif kind in {'CHANGE_METHOD_NAME', 'INLINE_METHOD_CALLS', 'CUSTOM_EXPRESSION_TEMPLATE'}:
+                if not (usage_kinds & executable_usage_kinds):
+                    errors_by_impact[impact_id].append(
+                        f'rewriteUnit {unit_id} {kind} requires an executable/member source usage, got {sorted(usage_kinds)}'
                     )
 
         # Generic stale-API guard for rewritten code: do not explicitly re-import or
@@ -712,6 +767,7 @@ def command_validate(args):
             'noSourceChangeCount': counts['NO_SOURCE_CHANGE'],
             'rewriteUnitCount': len(plan.get('rewriteUnits', [])),
             'methodBodyRewriteCount': sum(1 for u in plan.get('rewriteUnits', []) if u.get('recipeKind') == 'REPLACE_METHOD_BODY'),
+            'removeImportCount': sum(1 for u in plan.get('rewriteUnits', []) if u.get('recipeKind') == 'REMOVE_IMPORT'),
             'affectedSourceFileCount': len(affected_files),
             'confidenceCounts': dict(sorted(confidence_counts.items())),
         },
@@ -728,6 +784,7 @@ def command_validate(args):
         f"- No source change: {counts['NO_SOURCE_CHANGE']}",
         f"- Rewrite units: {len(plan.get('rewriteUnits', []))}",
         f"- Method-body rewrites: {final_plan['summary']['methodBodyRewriteCount']}",
+        f"- Remove-import units: {final_plan['summary']['removeImportCount']}",
         '', '| Source target | Decision | Replacement | Units | Confidence |',
         '|---|---|---|---|---|',
     ]
@@ -758,6 +815,7 @@ def command_empty(args):
             'noSourceChangeCount': 0,
             'rewriteUnitCount': 0,
             'methodBodyRewriteCount': 0,
+            'removeImportCount': 0,
             'affectedSourceFileCount': 0,
             'confidenceCounts': {},
         },
