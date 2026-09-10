@@ -215,17 +215,13 @@ jobs:
           echo "impact_count=${impact_count}" >> "${GITHUB_OUTPUT}"
           echo "needs_ai=${needs_ai}" >> "${GITHUB_OUTPUT}"
 
-      - name: Request batched AI migration plan
+      - name: Request AI migration plan
         if: steps.build.outputs.needs_ai == 'true'
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
           MODEL: ${{ env.GEMINI_MODEL }}
-          REASONING_EFFORT: ${{ env.AI_REASONING_EFFORT }}
-          MAX_OUTPUT_TOKENS: ${{ env.AI_MAX_OUTPUT_TOKENS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          BATCH_SIZE: "20"
-          MAX_RATE_LIMIT_RETRIES: "3"
         run: |
           set -euo pipefail
 
@@ -234,7 +230,7 @@ jobs:
             exit 1
           fi
 
-          python3 <<'PY'
+          python3 <<'PYREQ'
           import json
           import os
           from pathlib import Path
@@ -243,233 +239,110 @@ jobs:
           evidence = json.loads((out / "ai-migration-input.json").read_text(encoding="utf-8"))
           schema = json.loads((out / "ai-migration-output-schema.json").read_text(encoding="utf-8"))
           instructions = (out / "ai-migration-instructions.txt").read_text(encoding="utf-8").strip()
-          batch_size = int(os.environ["BATCH_SIZE"])
 
-          impacts = evidence.get("impacts", [])
-          batch_dir = out / "gemini-batches"
-          batch_dir.mkdir(parents=True, exist_ok=True)
-
-          manifest = {
-              "batchSize": batch_size,
-              "impactCount": len(impacts),
-              "batchCount": 0,
-              "batches": [],
-          }
-
-          for index, offset in enumerate(range(0, len(impacts), batch_size), start=1):
-              batch_impacts = impacts[offset:offset + batch_size]
-              batch_evidence = dict(evidence)
-              batch_evidence["impactCount"] = len(batch_impacts)
-              batch_evidence["impacts"] = batch_impacts
-
-              request = {
-                  "model": os.environ["MODEL"],
-                  "reasoning_effort": "low",
-                  "messages": [
-                      {"role": "system", "content": instructions},
-                      {
-                          "role": "user",
-                          "content": "Migration evidence JSON follows. Use only this data.\n"
-                                     + json.dumps(batch_evidence, sort_keys=True),
-                      },
-                  ],
-                  "response_format": {
-                      "type": "json_schema",
-                      "json_schema": {
-                          "name": "dependency_migration_plan",
-                          "strict": True,
-                          "schema": schema,
-                      },
-                  },
-              }
-
-              stem = f"batch-{index:03d}"
-              request_path = batch_dir / f"{stem}-request.json"
-              request_path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-              manifest["batches"].append({
-                  "batch": index,
-                  "request": str(request_path.relative_to(out)),
-                  "impactIds": [i["impactId"] for i in batch_impacts],
-              })
-
-          manifest["batchCount"] = len(manifest["batches"])
-          (out / "gemini-batch-manifest.json").write_text(
-              json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-          )
-          PY
-
-          batch_count="$(jq -r '.batchCount' "${OUTPUT_DIR}/gemini-batch-manifest.json")"
-          mkdir -p "${OUTPUT_DIR}/gemini-batches"
-
-          for batch in $(seq 1 "${batch_count}"); do
-            stem="$(printf 'batch-%03d' "${batch}")"
-            request_file="${OUTPUT_DIR}/gemini-batches/${stem}-request.json"
-            response_file="${OUTPUT_DIR}/gemini-batches/${stem}-response.json"
-            headers_file="${OUTPUT_DIR}/gemini-batches/${stem}-headers.txt"
-            raw_file="${OUTPUT_DIR}/gemini-batches/${stem}-raw-plan.json"
-
-            attempt=1
-            while true; do
-              : > "${headers_file}"
-              http_code="$(curl \
-                --silent \
-                --show-error \
-                --connect-timeout 20 \
-                --max-time 300 \
-                --output "${response_file}" \
-                --dump-header "${headers_file}" \
-                --write-out '%{http_code}' \
-                --request POST \
-                --header "Authorization: Bearer ${GEMINI_API_KEY}" \
-                --header 'Content-Type: application/json' \
-                --data-binary "@${request_file}" \
-                https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)"
-
-              if [[ "${http_code}" == "200" ]]; then
-                break
-              fi
-
-              error_message="$(jq -r '.error.message // .error // "unknown Gemini API error"' "${response_file}" 2>/dev/null || true)"
-
-              if [[ "${http_code}" == "429" && "${attempt}" -le "${MAX_RATE_LIMIT_RETRIES}" ]]; then
-                retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\\r", "", $2); print $2}' "${headers_file}" | tail -1)"
-                if [[ ! "${retry_after}" =~ ^[0-9]+$ ]]; then
-                  retry_after=10
-                fi
-                echo "Gemini rate limit for ${stem}; retrying in ${retry_after}s (attempt ${attempt}/${MAX_RATE_LIMIT_RETRIES})."
-                if [[ "${retry_after}" -gt 60 ]]; then retry_after=60; fi
-                sleep "${retry_after}"
-                attempt=$((attempt + 1))
-                continue
-              fi
-
-              if [[ "${http_code}" == "413" ]]; then
-                echo "::error::Gemini rejected ${stem} as too large even with BATCH_SIZE=${BATCH_SIZE}: ${error_message}"
-              else
-                echo "::error::Gemini Chat Completions API returned HTTP ${http_code} for ${stem}: ${error_message}"
-              fi
-              exit 1
-            done
-
-            jq -r '.choices[0].message.content // empty' "${response_file}" > "${raw_file}"
-
-            if [[ ! -s "${raw_file}" ]]; then
-              echo "::error::Gemini response for ${stem} contained no structured output text."
-              exit 1
-            fi
-            jq -e . "${raw_file}" >/dev/null
-          done
-
-          python3 <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          out = Path(os.environ["OUTPUT_DIR"])
-          manifest = json.loads((out / "gemini-batch-manifest.json").read_text(encoding="utf-8"))
-          decisions = []
-          summaries = []
-          responses = []
-          usage_totals = {}
-
-          for entry in manifest["batches"]:
-              stem = f"batch-{entry['batch']:03d}"
-              raw = json.loads((out / "gemini-batches" / f"{stem}-raw-plan.json").read_text(encoding="utf-8"))
-              response = json.loads((out / "gemini-batches" / f"{stem}-response.json").read_text(encoding="utf-8"))
-              batch_decisions = raw.get("decisions", [])
-              decisions.extend(batch_decisions)
-              if raw.get("summary"):
-                  summaries.append(raw["summary"])
-              usage = response.get("usage") or {}
-              for key, value in usage.items():
-                  if isinstance(value, int):
-                      usage_totals[key] = usage_totals.get(key, 0) + value
-              responses.append({
-                  "batch": entry["batch"],
-                  "responseId": response.get("id"),
-                  "model": response.get("model"),
-                  "status": "completed",
-                  "usage": usage,
-              })
-
-          combined = {
-              "summary": " | ".join(summaries),
-              "decisions": decisions,
-          }
-          (out / "ai-migration-plan-raw.json").write_text(
-              json.dumps(combined, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-          )
-          metadata = {
-              "provider": "Google Gemini",
-              "endpoint": "OpenAI-compatible Chat Completions API",
+          request = {
               "model": os.environ["MODEL"],
-              "store": False,
-              "batchSize": int(os.environ["BATCH_SIZE"]),
-              "batchCount": manifest["batchCount"],
-              "responses": responses,
-              "usageTotals": usage_totals,
+              "reasoning_effort": "low",
+              "messages": [
+                  {"role": "system", "content": instructions},
+                  {
+                      "role": "user",
+                      "content": "Migration evidence JSON follows. Return exactly one decision for every supplied impactId. Use only this evidence plus well-known migration knowledge as allowed by the system instructions.\n"
+                                 + json.dumps(evidence, sort_keys=True),
+                  },
+              ],
+              "response_format": {
+                  "type": "json_schema",
+                  "json_schema": {
+                      "name": "dependency_migration_plan",
+                      "strict": True,
+                      "schema": schema,
+                  },
+              },
           }
-          (out / "ai-provider-metadata.json").write_text(
-              json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          (out / "gemini-initial-request.json").write_text(
+              json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
-          PY
+          PYREQ
 
-      - name: Repair incomplete AI OpenRewrite specifications
+          response_file="${OUTPUT_DIR}/gemini-initial-response.json"
+          headers_file="${OUTPUT_DIR}/gemini-initial-headers.txt"
+          raw_file="${OUTPUT_DIR}/ai-migration-plan-raw.json"
+
+          http_code="$(curl \
+            --silent \
+            --show-error \
+            --connect-timeout 20 \
+            --max-time 300 \
+            --output "${response_file}" \
+            --dump-header "${headers_file}" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GEMINI_API_KEY}" \
+            --header 'Content-Type: application/json' \
+            --data-binary "@${OUTPUT_DIR}/gemini-initial-request.json" \
+            https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)"
+
+          if [[ "${http_code}" != "200" ]]; then
+            error_message="$(jq -r '.error.message // .error // "unknown Gemini API error"' "${response_file}" 2>/dev/null || true)"
+            if [[ "${http_code}" == "429" ]]; then
+              echo "::error::GEMINI_RATE_LIMIT_EXCEEDED during initial planning request. No long retry is performed: ${error_message}"
+            else
+              echo "::error::Gemini initial planning request returned HTTP ${http_code}: ${error_message}"
+            fi
+            exit 1
+          fi
+
+          jq -r '.choices[0].message.content // empty' "${response_file}" > "${raw_file}"
+          if [[ ! -s "${raw_file}" ]]; then
+            echo "::error::Gemini initial response contained no structured output text."
+            exit 1
+          fi
+          jq -e . "${raw_file}" >/dev/null
+
+      - name: Validate initial plan and perform at most one repair request
         if: steps.build.outputs.needs_ai == 'true'
         shell: bash
         env:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
           PLANNER: .github/scripts/ai-migration-planner.py
           MODEL: ${{ env.GEMINI_MODEL }}
-          REASONING_EFFORT: ${{ env.AI_REASONING_EFFORT }}
-          MAX_OUTPUT_TOKENS: ${{ env.AI_MAX_OUTPUT_TOKENS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          REPAIR_BATCH_SIZE: "8"
-          MAX_REPAIR_ROUNDS: "3"
-          MAX_RATE_LIMIT_RETRIES: "3"
         run: |
           set -euo pipefail
 
-          if [[ -z "${GEMINI_API_KEY:-}" ]]; then
-            echo "::error::Repository secret GEMINI_API_KEY is not configured."
+          check_file="${OUTPUT_DIR}/ai-migration-repair-check.json"
+          python3 "${PLANNER}" check \
+            --input "${OUTPUT_DIR}/ai-migration-input.json" \
+            --raw-plan "${OUTPUT_DIR}/ai-migration-plan-raw.json" \
+            --report "${check_file}"
+
+          if [[ "$(jq -r '.valid' "${check_file}")" == "true" ]]; then
+            echo "Initial Gemini plan is machine-actionable; no repair request required."
+            exit 0
+          fi
+
+          if [[ "$(jq '.globalErrors | length' "${check_file}")" -gt 0 ]]; then
+            echo "::error::Initial Gemini plan has global structural errors; refusing extra exploratory calls."
+            jq . "${check_file}"
             exit 1
           fi
 
-          for round in $(seq 1 "${MAX_REPAIR_ROUNDS}"); do
-            check_file="${OUTPUT_DIR}/ai-migration-repair-check.json"
-            python3 "${PLANNER}" check \
-              --input "${OUTPUT_DIR}/ai-migration-input.json" \
-              --raw-plan "${OUTPUT_DIR}/ai-migration-plan-raw.json" \
-              --report "${check_file}"
+          invalid_count="$(jq '.invalidImpacts | length' "${check_file}")"
+          if [[ "${invalid_count}" -eq 0 ]]; then
+            echo "::error::Initial Gemini plan is invalid but contains no repairable impacts."
+            jq . "${check_file}"
+            exit 1
+          fi
 
-            if [[ "$(jq -r '.valid' "${check_file}")" == "true" ]]; then
-              echo "AI plan is machine-actionable after $((round - 1)) repair round(s)."
-              break
-            fi
+          echo "Initial plan has ${invalid_count} invalid impact(s); issuing the single allowed repair request."
 
-            invalid_count="$(jq -r '.invalidImpacts | length' "${check_file}")"
-            global_count="$(jq -r '.globalErrors | length' "${check_file}")"
-            if [[ "${global_count}" -gt 0 ]]; then
-              echo "::error::AI plan has global structural errors that cannot be impact-repaired."
-              jq . "${check_file}"
-              exit 1
-            fi
-            if [[ "${invalid_count}" -eq 0 ]]; then
-              echo "::error::AI repair check is invalid but contains no repairable impacts."
-              jq . "${check_file}"
-              exit 1
-            fi
-
-            echo "Repair round ${round}: ${invalid_count} impact decision(s) need a more concrete OpenRewrite specification."
-
-            ROUND="${round}" python3 <<'PY'
+          python3 <<'PYREPAIR'
           import json
           import os
           from pathlib import Path
 
           out = Path(os.environ["OUTPUT_DIR"])
-          round_no = int(os.environ["ROUND"])
-          batch_size = int(os.environ["REPAIR_BATCH_SIZE"])
           evidence = json.loads((out / "ai-migration-input.json").read_text(encoding="utf-8"))
           schema = json.loads((out / "ai-migration-output-schema.json").read_text(encoding="utf-8"))
           base_instructions = (out / "ai-migration-instructions.txt").read_text(encoding="utf-8").strip()
@@ -477,168 +350,146 @@ jobs:
           raw_plan = json.loads((out / "ai-migration-plan-raw.json").read_text(encoding="utf-8"))
 
           impact_by_id = {i["impactId"]: i for i in evidence.get("impacts", [])}
-          previous_by_id = {d.get("impactId"): d for d in raw_plan.get("decisions", []) if isinstance(d, dict)}
+          previous_by_id = {
+              d.get("impactId"): d for d in raw_plan.get("decisions", [])
+              if isinstance(d, dict) and d.get("impactId")
+          }
           invalid = check.get("invalidImpacts", [])
+          invalid_ids = [item["impactId"] for item in invalid]
 
-          repair_root = out / "gemini-repairs" / f"round-{round_no:02d}"
-          repair_root.mkdir(parents=True, exist_ok=True)
-          manifest = {"round": round_no, "batchSize": batch_size, "invalidImpactCount": len(invalid), "batches": []}
+          repair_evidence = dict(evidence)
+          repair_evidence["impactCount"] = len(invalid_ids)
+          repair_evidence["impacts"] = [impact_by_id[i] for i in invalid_ids]
+          repair_evidence["repairContext"] = [
+              {
+                  "impactId": item["impactId"],
+                  "validationErrors": item.get("errors", []),
+                  "previousDecision": previous_by_id.get(item["impactId"]),
+              }
+              for item in invalid
+          ]
 
           repair_instructions = base_instructions + """
 
-          REPAIR MODE:
-          The previous decisions below failed machine validation. Return a corrected decision for EVERY supplied impactId and fix EVERY listed validation error.
-          Do not repeat an invalid openRewrite specification.
-          For decision REWRITE, openRewrite.recipeKind MUST be exactly one of CHANGE_METHOD_NAME, INLINE_METHOD_CALLS, CUSTOM_JAVA_TEMPLATE.
-          CHANGE_METHOD_NAME requires a valid OpenRewrite methodPattern and non-null newMethodName.
-          INLINE_METHOD_CALLS requires a valid methodPattern and a non-empty replacement expression/template.
-          CUSTOM_JAVA_TEMPLATE requires a valid methodPattern and a non-empty replacement expression/template.
+          REPAIR MODE — THIS IS THE ONLY REPAIR REQUEST:
+          Return one corrected decision for EVERY supplied impactId and for NO OTHER impactId.
+          Fix EVERY validationErrors entry. Preserve valid parts of the previous decision where useful.
+          The result must pass machine validation without another AI call.
+          For REWRITE, recipeKind must be CHANGE_METHOD_NAME, INLINE_METHOD_CALLS, or CUSTOM_JAVA_TEMPLATE.
+          CHANGE_METHOD_NAME requires methodPattern and newMethodName.
+          INLINE_METHOD_CALLS and CUSTOM_JAVA_TEMPLATE require methodPattern and replacement.
           Never use recipeKind NONE for REWRITE.
-          A methodPattern must use OpenRewrite MethodMatcher syntax, e.g. 'org.hibernate.Session createCriteria(java.lang.Class)'.
-          replacement must be directly usable by the generated recipe and use #{p0}, #{p1}, ... for original invocation arguments when applicable.
-          If the prior high-level solution cannot be represented by the selected recipe kind, revise the solution and choose CUSTOM_JAVA_TEMPLATE with the most concrete invocation-level replacement that advances the source to the target API.
-          Do not return decisions for impactIds not supplied in this repair request.
+          Method patterns use OpenRewrite MethodMatcher syntax, e.g. 'org.hibernate.Session createCriteria(java.lang.Class)'.
+          Placeholder arity is strict: () allows no #{pN}; (A) allows only #{p0}; (A,B) allows only #{p0} and #{p1}.
+          For exact evidence-backed javax.* -> jakarta.* replacements, use the supplied jakarta candidate and never an unrelated same-simple-name type.
           """.strip()
 
-          for index, offset in enumerate(range(0, len(invalid), batch_size), start=1):
-              items = invalid[offset:offset + batch_size]
-              batch_impacts = []
-              repair_context = []
-              for item in items:
-                  impact_id = item["impactId"]
-                  batch_impacts.append(impact_by_id[impact_id])
-                  repair_context.append({
-                      "impactId": impact_id,
-                      "validationErrors": item.get("errors", []),
-                      "previousDecision": previous_by_id.get(impact_id),
-                  })
-              batch_evidence = dict(evidence)
-              batch_evidence["impactCount"] = len(batch_impacts)
-              batch_evidence["impacts"] = batch_impacts
-              batch_evidence["repairContext"] = repair_context
-
-              request = {
-                  "model": os.environ["MODEL"],
-                  "reasoning_effort": "low",
-                  "messages": [
-                      {"role": "system", "content": repair_instructions},
-                      {"role": "user", "content": "Repair evidence JSON follows.\n" + json.dumps(batch_evidence, sort_keys=True)},
-                  ],
-                  "response_format": {
-                      "type": "json_schema",
-                      "json_schema": {
-                          "name": "dependency_migration_plan_repair",
-                          "strict": True,
-                          "schema": schema,
-                      },
+          request = {
+              "model": os.environ["MODEL"],
+              "reasoning_effort": "low",
+              "messages": [
+                  {"role": "system", "content": repair_instructions},
+                  {
+                      "role": "user",
+                      "content": "Repair evidence JSON follows.\n" + json.dumps(repair_evidence, sort_keys=True),
                   },
-              }
-              stem = f"batch-{index:03d}"
-              request_path = repair_root / f"{stem}-request.json"
-              request_path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-              manifest["batches"].append({"batch": index, "impactIds": [i["impactId"] for i in batch_impacts]})
+              ],
+              "response_format": {
+                  "type": "json_schema",
+                  "json_schema": {
+                      "name": "dependency_migration_plan_repair",
+                      "strict": True,
+                      "schema": schema,
+                  },
+              },
+          }
+          (out / "gemini-repair-request.json").write_text(
+              json.dumps(request, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PYREPAIR
 
-          manifest["batchCount"] = len(manifest["batches"])
-          (repair_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-          PY
+          response_file="${OUTPUT_DIR}/gemini-repair-response.json"
+          headers_file="${OUTPUT_DIR}/gemini-repair-headers.txt"
+          repaired_file="${OUTPUT_DIR}/gemini-repair-raw-plan.json"
 
-            repair_root="${OUTPUT_DIR}/gemini-repairs/round-$(printf '%02d' "${round}")"
-            batch_count="$(jq -r '.batchCount' "${repair_root}/manifest.json")"
+          http_code="$(curl \
+            --silent \
+            --show-error \
+            --connect-timeout 20 \
+            --max-time 300 \
+            --output "${response_file}" \
+            --dump-header "${headers_file}" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GEMINI_API_KEY}" \
+            --header 'Content-Type: application/json' \
+            --data-binary "@${OUTPUT_DIR}/gemini-repair-request.json" \
+            https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)"
 
-            for batch in $(seq 1 "${batch_count}"); do
-              stem="$(printf 'batch-%03d' "${batch}")"
-              request_file="${repair_root}/${stem}-request.json"
-              response_file="${repair_root}/${stem}-response.json"
-              headers_file="${repair_root}/${stem}-headers.txt"
-              raw_file="${repair_root}/${stem}-raw-plan.json"
+          if [[ "${http_code}" != "200" ]]; then
+            error_message="$(jq -r '.error.message // .error // "unknown Gemini API error"' "${response_file}" 2>/dev/null || true)"
+            if [[ "${http_code}" == "429" ]]; then
+              echo "::error::GEMINI_RATE_LIMIT_EXCEEDED during the single repair request. No retry loop is performed: ${error_message}"
+            else
+              echo "::error::Gemini repair request returned HTTP ${http_code}: ${error_message}"
+            fi
+            exit 1
+          fi
 
-              attempt=1
-              while true; do
-                : > "${headers_file}"
-                http_code="$(curl \
-                  --silent \
-                  --show-error \
-                  --connect-timeout 20 \
-                  --max-time 300 \
-                  --output "${response_file}" \
-                  --dump-header "${headers_file}" \
-                  --write-out '%{http_code}' \
-                  --request POST \
-                  --header "Authorization: Bearer ${GEMINI_API_KEY}" \
-                  --header 'Content-Type: application/json' \
-                  --data-binary "@${request_file}" \
-                  https://generativelanguage.googleapis.com/v1beta/openai/chat/completions)"
+          jq -r '.choices[0].message.content // empty' "${response_file}" > "${repaired_file}"
+          if [[ ! -s "${repaired_file}" ]]; then
+            echo "::error::Gemini repair response contained no structured output text."
+            exit 1
+          fi
+          jq -e . "${repaired_file}" >/dev/null
 
-                if [[ "${http_code}" == "200" ]]; then
-                  break
-                fi
-
-                error_message="$(jq -r '.error.message // .error // "unknown Gemini API error"' "${response_file}" 2>/dev/null || true)"
-                if [[ "${http_code}" == "429" && "${attempt}" -le "${MAX_RATE_LIMIT_RETRIES}" ]]; then
-                  retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\\r", "", $2); print $2}' "${headers_file}" | tail -1)"
-                  if [[ ! "${retry_after}" =~ ^[0-9]+$ ]]; then retry_after=10; fi
-                  echo "Gemini rate limit during repair ${round}/${stem}; retrying in ${retry_after}s."
-                  if [[ "${retry_after}" -gt 60 ]]; then retry_after=60; fi
-                  sleep "${retry_after}"
-                  attempt=$((attempt + 1))
-                  continue
-                fi
-                echo "::error::Gemini repair request returned HTTP ${http_code}: ${error_message}"
-                exit 1
-              done
-
-              jq -r '.choices[0].message.content // empty' "${response_file}" > "${raw_file}"
-              jq -e . "${raw_file}" >/dev/null
-            done
-
-            ROUND="${round}" python3 <<'PY'
+          python3 <<'PYMERGE'
           import json
           import os
           from pathlib import Path
 
           out = Path(os.environ["OUTPUT_DIR"])
-          round_no = int(os.environ["ROUND"])
           raw_path = out / "ai-migration-plan-raw.json"
           combined = json.loads(raw_path.read_text(encoding="utf-8"))
-          decisions = {d.get("impactId"): d for d in combined.get("decisions", []) if isinstance(d, dict) and d.get("impactId")}
-          repair_root = out / "gemini-repairs" / f"round-{round_no:02d}"
-          manifest = json.loads((repair_root / "manifest.json").read_text(encoding="utf-8"))
+          check = json.loads((out / "ai-migration-repair-check.json").read_text(encoding="utf-8"))
+          repaired = json.loads((out / "gemini-repair-raw-plan.json").read_text(encoding="utf-8"))
 
-          expected = set()
+          expected = {item["impactId"] for item in check.get("invalidImpacts", [])}
           replacements = {}
-          for entry in manifest["batches"]:
-              expected.update(entry["impactIds"])
-              stem = f"batch-{entry['batch']:03d}"
-              repaired = json.loads((repair_root / f"{stem}-raw-plan.json").read_text(encoding="utf-8"))
-              for decision in repaired.get("decisions", []):
-                  impact_id = decision.get("impactId")
-                  if impact_id not in expected:
-                      raise SystemExit(f"Repair response returned unexpected impactId {impact_id}")
-                  if impact_id in replacements:
-                      raise SystemExit(f"Repair response duplicated impactId {impact_id}")
-                  replacements[impact_id] = decision
+          for decision in repaired.get("decisions", []):
+              impact_id = decision.get("impactId")
+              if impact_id not in expected:
+                  raise SystemExit(f"Repair response returned unexpected impactId {impact_id}")
+              if impact_id in replacements:
+                  raise SystemExit(f"Repair response duplicated impactId {impact_id}")
+              replacements[impact_id] = decision
 
           missing = sorted(expected - set(replacements))
           if missing:
               raise SystemExit("Repair response missed impactIds: " + ", ".join(missing))
 
+          decisions = {
+              d.get("impactId"): d for d in combined.get("decisions", [])
+              if isinstance(d, dict) and d.get("impactId")
+          }
           decisions.update(replacements)
           combined["decisions"] = [decisions[k] for k in sorted(decisions)]
-          combined["summary"] = (combined.get("summary") or "") + f" | repair round {round_no}: {len(replacements)} decision(s) corrected"
+          combined["summary"] = (combined.get("summary") or "") + f" | single repair: {len(replacements)} decision(s) corrected"
           raw_path.write_text(json.dumps(combined, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-          PY
-          done
+          PYMERGE
 
           python3 "${PLANNER}" check \
             --input "${OUTPUT_DIR}/ai-migration-input.json" \
             --raw-plan "${OUTPUT_DIR}/ai-migration-plan-raw.json" \
-            --report "${OUTPUT_DIR}/ai-migration-repair-check.json"
+            --report "${check_file}"
 
-          if [[ "$(jq -r '.valid' "${OUTPUT_DIR}/ai-migration-repair-check.json")" != "true" ]]; then
-            echo "::error::AI plan is still not machine-actionable after ${MAX_REPAIR_ROUNDS} targeted repair rounds."
-            jq . "${OUTPUT_DIR}/ai-migration-repair-check.json"
+          if [[ "$(jq -r '.valid' "${check_file}")" != "true" ]]; then
+            echo "::error::AI plan is still not machine-actionable after the single repair request."
+            jq . "${check_file}"
             exit 1
           fi
+
+          echo "AI plan is machine-actionable after one repair request."
 
       - name: Validate and enrich AI migration plan
         if: steps.build.outputs.needs_ai == 'true'
