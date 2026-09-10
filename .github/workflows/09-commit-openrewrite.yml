@@ -1,14 +1,19 @@
-name: PR 09 - Commit verified OpenRewrite migration
+name: PR 09 - Commit OpenRewrite migration
 
 on:
   workflow_dispatch:
     inputs:
       step8_run_id:
-        description: GitHub Actions run ID of a successful PR 08 - Apply OpenRewrite migration run
+        description: GitHub Actions run ID of PR 08 - Apply OpenRewrite migration
         required: true
         type: string
       confirm_push:
-        description: Confirm that the verified patch should be committed and pushed to the PR branch
+        description: Confirm that the generated patch should be committed and pushed to the PR branch
+        required: true
+        default: false
+        type: boolean
+      allow_failed_build:
+        description: TEST ONLY - allow commit when OpenRewrite and diff checks passed but the post-rewrite Maven build failed
         required: true
         default: false
         type: boolean
@@ -20,7 +25,7 @@ permissions:
 
 jobs:
   commit-verified-patch:
-    name: Commit and push verified migration
+    name: Commit and push migration
     if: inputs.confirm_push == true
     runs-on: ubuntu-latest
 
@@ -32,6 +37,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           STEP8_RUN_ID: ${{ inputs.step8_run_id }}
+          ALLOW_FAILED_BUILD: ${{ inputs.allow_failed_build }}
         run: |
           set -euo pipefail
 
@@ -57,12 +63,18 @@ jobs:
             exit 1
           fi
 
-          if [[ "${conclusion}" != "success" ]]; then
-            echo "::error::Step 8 run ${run_id} conclusion is '${conclusion}', expected 'success'."
+          if [[ "${conclusion}" != "success" && "${conclusion}" != "failure" ]]; then
+            echo "::error::Step 8 run ${run_id} conclusion is '${conclusion}', expected 'success' or 'failure'."
+            exit 1
+          fi
+
+          if [[ "${conclusion}" == "failure" && "${ALLOW_FAILED_BUILD}" != "true" ]]; then
+            echo "::error::Step 8 run ${run_id} failed. Set allow_failed_build=true only for an intentional test commit."
             exit 1
           fi
 
           echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+          echo "conclusion=${conclusion}" >> "${GITHUB_OUTPUT}"
 
       - name: Download and verify Step 8 artifact
         shell: bash
@@ -70,6 +82,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ steps.source.outputs.run_id }}
+          STEP8_CONCLUSION: ${{ steps.source.outputs.conclusion }}
+          ALLOW_FAILED_BUILD: ${{ inputs.allow_failed_build }}
         run: |
           set -euo pipefail
 
@@ -112,9 +126,46 @@ jobs:
           checksum_dir="$(dirname "${checksum_path}")"
           (cd "${checksum_dir}" && sha256sum --check --strict SHA256SUMS)
 
-          if [[ "$(jq -r '.successful' "${result_path}")" != "true" ]]; then
-            echo "::error::Step 8 result is not successful."
-            exit 1
+          step8_successful="$(jq -r '.successful // false' "${result_path}")"
+          failure_reason="$(jq -r '.failureReason // empty' "${result_path}")"
+          rewrite_exit="$(jq -r '.rewriteExitCode // empty' "${result_path}")"
+          diff_exit="$(jq -r '.gitDiffCheckExitCode // empty' "${result_path}")"
+          test_exit="$(jq -r '.mavenTestExitCode // empty' "${result_path}")"
+
+          verification_bypassed=false
+          if [[ "${step8_successful}" != "true" ]]; then
+            if [[ "${ALLOW_FAILED_BUILD}" != "true" ]]; then
+              echo "::error::Step 8 result is not successful. Set allow_failed_build=true only for an intentional test commit."
+              exit 1
+            fi
+
+            if [[ "${STEP8_CONCLUSION}" != "failure" ]]; then
+              echo "::error::Step 8 artifact reports successful=false, but the workflow conclusion is '${STEP8_CONCLUSION}'. Refusing inconsistent evidence."
+              exit 1
+            fi
+
+            if [[ "${failure_reason}" != "MIGRATED_BUILD_FAILED" ]]; then
+              echo "::error::Failed-build bypass is permitted only for MIGRATED_BUILD_FAILED, got '${failure_reason:-<none>}'."
+              exit 1
+            fi
+
+            if [[ "${rewrite_exit}" != "0" ]]; then
+              echo "::error::Failed-build bypass requires rewriteExitCode=0, got '${rewrite_exit:-<none>}'."
+              exit 1
+            fi
+
+            if [[ "${diff_exit}" != "0" ]]; then
+              echo "::error::Failed-build bypass requires gitDiffCheckExitCode=0, got '${diff_exit:-<none>}'."
+              exit 1
+            fi
+
+            if [[ ! "${test_exit}" =~ ^[0-9]+$ || "${test_exit}" -eq 0 ]]; then
+              echo "::error::Failed-build bypass requires a non-zero Maven test exit code, got '${test_exit:-<none>}'."
+              exit 1
+            fi
+
+            verification_bypassed=true
+            echo "::warning::TEST MODE: committing a migration whose post-rewrite Maven build failed with exit ${test_exit}."
           fi
 
           if [[ "$(jq -r '.commitCreated' "${result_path}")" != "false" ]]; then
@@ -165,6 +216,10 @@ jobs:
           echo "PR_NUMBER=${pr_number}" >> "${GITHUB_ENV}"
           echo "PR_HEAD_SHA=${head_sha}" >> "${GITHUB_ENV}"
           echo "VERIFIED_CHANGED_COUNT=${changed_count}" >> "${GITHUB_ENV}"
+          echo "STEP8_SUCCESSFUL=${step8_successful}" >> "${GITHUB_ENV}"
+          echo "STEP8_FAILURE_REASON=${failure_reason}" >> "${GITHUB_ENV}"
+          echo "POST_REWRITE_MAVEN_EXIT=${test_exit}" >> "${GITHUB_ENV}"
+          echo "VERIFICATION_BYPASSED=${verification_bypassed}" >> "${GITHUB_ENV}"
 
       - name: Verify PR is still at analyzed head and is writable
         shell: bash
@@ -251,10 +306,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          subject="chore: apply generated OpenRewrite migration"
+          verification_line="Verified by PR 08 run ${STEP8_RUN_ID}."
+
+          if [[ "${VERIFICATION_BYPASSED:-false}" == "true" ]]; then
+            subject="chore: apply generated OpenRewrite migration [build failing]"
+            verification_line="TEST MODE: PR 08 run ${STEP8_RUN_ID} produced a valid patch but post-rewrite Maven tests failed (exit ${POST_REWRITE_MAVEN_EXIT:-unknown})."
+          fi
+
           git commit \
-            -m "chore: apply generated OpenRewrite migration" \
-            -m "Verified by PR 08 run ${STEP8_RUN_ID}." \
-            -m "Verified source HEAD: ${PR_HEAD_SHA}"
+            -m "${subject}" \
+            -m "${verification_line}" \
+            -m "Source HEAD: ${PR_HEAD_SHA}"
 
           commit_sha="$(git rev-parse HEAD)"
           echo "commit_sha=${commit_sha}" >> "${GITHUB_OUTPUT}"
@@ -326,6 +389,7 @@ jobs:
           STEP8_RUN_ID: ${{ steps.source.outputs.run_id }}
           COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
           PUSH_PERFORMED: ${{ steps.push.outputs.performed }}
+          ALLOW_FAILED_BUILD: ${{ inputs.allow_failed_build }}
         run: |
           set -euo pipefail
 
@@ -348,6 +412,11 @@ jobs:
           PR_HEAD_REF="${PR_HEAD_REF:-}" \
           COMMIT_SHA="${COMMIT_SHA:-}" \
           PUSH_PERFORMED="${PUSH_PERFORMED:-false}" \
+          ALLOW_FAILED_BUILD="${ALLOW_FAILED_BUILD:-false}" \
+          STEP8_SUCCESSFUL="${STEP8_SUCCESSFUL:-false}" \
+          STEP8_FAILURE_REASON="${STEP8_FAILURE_REASON:-}" \
+          POST_REWRITE_MAVEN_EXIT="${POST_REWRITE_MAVEN_EXIT:-}" \
+          VERIFICATION_BYPASSED="${VERIFICATION_BYPASSED:-false}" \
           OUTPUT_DIR="${output_dir}" \
           python3 <<'PY'
           import json
@@ -372,6 +441,11 @@ jobs:
               "commitSha": os.environ.get("COMMIT_SHA") or None,
               "commitCreated": bool(os.environ.get("COMMIT_SHA")),
               "pushPerformed": os.environ.get("PUSH_PERFORMED") == "true",
+              "allowFailedBuild": os.environ.get("ALLOW_FAILED_BUILD") == "true",
+              "sourceStep8Successful": os.environ.get("STEP8_SUCCESSFUL") == "true",
+              "sourceStep8FailureReason": os.environ.get("STEP8_FAILURE_REASON") or None,
+              "postRewriteMavenTestExitCode": as_int(os.environ.get("POST_REWRITE_MAVEN_EXIT")),
+              "verificationBypassed": os.environ.get("VERIFICATION_BYPASSED") == "true",
           }
 
           (output_dir / "step9-result.json").write_text(
@@ -389,15 +463,19 @@ jobs:
           )
 
           {
-            echo "## Verified OpenRewrite migration commit"
+            echo "## OpenRewrite migration commit"
             echo
             echo "- Source Step 8 run: \`${STEP8_RUN_ID:-unknown}\`"
             echo "- PR: \`#${PR_NUMBER:-unknown}\`"
             echo "- Branch: \`${PR_HEAD_REF:-unknown}\`"
-            echo "- Verified HEAD: \`${PR_HEAD_SHA:-unknown}\`"
+            echo "- Source HEAD: \`${PR_HEAD_SHA:-unknown}\`"
             echo "- Commit: \`${COMMIT_SHA:-not-created}\`"
             echo "- Push performed: \`${PUSH_PERFORMED:-false}\`"
-            echo "- Verified changed files: \`${VERIFIED_CHANGED_COUNT:-unknown}\`"
+            echo "- Changed files: \`${VERIFIED_CHANGED_COUNT:-unknown}\`"
+            echo "- Step 8 successful: \`${STEP8_SUCCESSFUL:-unknown}\`"
+            echo "- Step 8 failure reason: \`${STEP8_FAILURE_REASON:-none}\`"
+            echo "- Post-rewrite Maven exit: \`${POST_REWRITE_MAVEN_EXIT:-unknown}\`"
+            echo "- Failed-build bypass used: \`${VERIFICATION_BYPASSED:-false}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload Step 9 audit artifact
