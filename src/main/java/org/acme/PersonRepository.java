@@ -150,10 +150,7 @@ public class PersonRepository implements PanacheRepository<Person> {
     }
 
     /**
-     * Intentionally legacy Hibernate Criteria API.
-     *
-     * This is exactly the kind of API migration we want the pipeline
-     * to detect when moving from Hibernate 5.6 to Hibernate 6.
+     * Legacy Hibernate Criteria API (verfuegbar in Hibernate 5.6.x).
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findUsingLegacyCriteria(String lastName) {
@@ -166,7 +163,7 @@ public class PersonRepository implements PanacheRepository<Person> {
     }
 
     /**
-     * Another legacy Criteria use case with ordering and limit.
+     * Legacy Criteria use case with ordering and limit.
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findLatestUsingLegacyCriteria() {
