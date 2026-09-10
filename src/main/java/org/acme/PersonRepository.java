@@ -3,17 +3,9 @@ package org.acme;
 import io.quarkus.hibernate.orm.panache.PanacheRepository;
 import jakarta.persistence.EntityManager;
 import jakarta.transaction.Transactional;
-import org.hibernate.Criteria;
 import org.hibernate.LockMode;
 import org.hibernate.LockOptions;
 import org.hibernate.Session;
-import org.hibernate.criterion.DetachedCriteria;
-import org.hibernate.criterion.Example;
-import org.hibernate.criterion.MatchMode;
-import org.hibernate.criterion.Order;
-import org.hibernate.criterion.Projections;
-import org.hibernate.criterion.Restrictions;
-import org.hibernate.criterion.Subqueries;
 import org.hibernate.query.Query;
 import org.hibernate.type.StandardBasicTypes;
 
@@ -48,10 +40,13 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findByLastNameUsingClassicCriteria(String lastName) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("lastName", lastName));
-        criteria.addOrder(Order.asc("firstName"));
-        return criteria.list();
+        Query<Person> query = session().createQuery(
+                "from Person p where p.lastName = :lastName order by p.firstName asc",
+                Person.class
+        );
+        return query
+                .setParameter("lastName", lastName)
+                .list();
     }
 
     /**
@@ -59,10 +54,16 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings("deprecation")
     public Optional<Person> findByEmailUsingClassicCriteria(String email) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("email", email));
-        criteria.setMaxResults(1);
-        return Optional.ofNullable((Person) criteria.uniqueResult());
+        Query<Person> query = session().createQuery(
+                "from Person p where p.email = :email",
+                Person.class
+        );
+        return query
+                .setParameter("email", email)
+                .setMaxResults(1)
+                .list()
+                .stream()
+                .findFirst();
     }
 
     /**
@@ -70,11 +71,13 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findActiveByCityIgnoringCase(String city) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("active", true));
-        criteria.add(Restrictions.ilike("city", city, MatchMode.EXACT));
-        criteria.addOrder(Order.desc("createdAt"));
-        return criteria.list();
+        Query<Person> query = session().createQuery(
+                "from Person p where p.active = true and lower(p.city) = lower(:city) order by p.createdAt desc",
+                Person.class
+        );
+        return query
+                .setParameter("city", city)
+                .list();
     }
 
     /**
@@ -82,21 +85,55 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findByExampleUsingHibernateExample(Person probe) {
-        Criteria criteria = session().createCriteria(Person.class);
+        StringBuilder hql = new StringBuilder("from Person p where 1=1");
+        java.util.Map<String, Object> parameters = new java.util.LinkedHashMap<>();
 
-        Example example = Example.create(probe)
-                .excludeZeroes()
-                .excludeProperty("id")
-                .excludeProperty("version")
-                .excludeProperty("createdAt")
-                .excludeProperty("active")
-                .ignoreCase()
-                .enableLike(MatchMode.START);
+        try {
+            for (java.beans.PropertyDescriptor propertyDescriptor : java.beans.Introspector.getBeanInfo(Person.class, Object.class).getPropertyDescriptors()) {
+                String property = propertyDescriptor.getName();
+                if ("id".equals(property) || "version".equals(property) || "createdAt".equals(property) || "active".equals(property)) {
+                    continue;
+                }
 
-        criteria.add(example);
-        criteria.addOrder(Order.asc("lastName"));
-        criteria.addOrder(Order.asc("firstName"));
-        return criteria.list();
+                java.lang.reflect.Method readMethod = propertyDescriptor.getReadMethod();
+                if (readMethod == null) {
+                    continue;
+                }
+
+                Object value = readMethod.invoke(probe);
+                if (value == null) {
+                    continue;
+                }
+
+                if (value instanceof Number && ((Number) value).doubleValue() == 0.0d) {
+                    continue;
+                }
+
+                if (value instanceof CharSequence && ((CharSequence) value).length() == 0) {
+                    continue;
+                }
+
+                if (value instanceof String) {
+                    String parameterName = property + "Prefix";
+                    hql.append(" and lower(p.").append(property).append(") like :").append(parameterName);
+                    parameters.put(parameterName, ((String) value).toLowerCase() + "%");
+                } else {
+                    hql.append(" and p.").append(property).append(" = :").append(property);
+                    parameters.put(property, value);
+                }
+            }
+        } catch (ReflectiveOperationException | java.beans.IntrospectionException ex) {
+            throw new IllegalStateException("Failed to build example query", ex);
+        }
+
+        hql.append(" order by p.lastName asc, p.firstName asc");
+
+        Query<Person> query = session().createQuery(hql.toString(), Person.class);
+        for (java.util.Map.Entry<String, Object> entry : parameters.entrySet()) {
+            query.setParameter(entry.getKey(), entry.getValue());
+        }
+
+        return query.list();
     }
 
     /**
@@ -104,11 +141,13 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findLatestActiveUsingClassicCriteria(int maxResults) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("active", true));
-        criteria.addOrder(Order.desc("createdAt"));
-        criteria.setMaxResults(maxResults);
-        return criteria.list();
+        Query<Person> query = session().createQuery(
+                "from Person p where p.active = true order by p.createdAt desc",
+                Person.class
+        );
+        return query
+                .setMaxResults(maxResults)
+                .list();
     }
 
     /**
@@ -116,10 +155,13 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings("deprecation")
     public long countByLastNameUsingProjection(String lastName) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("lastName", lastName));
-        criteria.setProjection(Projections.rowCount());
-        return (Long) criteria.uniqueResult();
+        Long result = session().createQuery(
+                "select count(p) from Person p where p.lastName = :lastName",
+                Long.class
+        )
+        .setParameter("lastName", lastName)
+                .uniqueResult();
+        return result;
     }
 
     /**
@@ -127,18 +169,16 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Map<String, Object>> findProjectedActivePeople() {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("active", true));
-        criteria.setProjection(
-                Projections.projectionList()
-                        .add(Projections.property("id"), "id")
-                        .add(Projections.property("firstName"), "firstName")
-                        .add(Projections.property("lastName"), "lastName")
-                        .add(Projections.property("email"), "email")
-                        .add(Projections.property("createdAt"), "createdAt")
+        Query<?> query = session().createQuery(
+                "select new map(" +
+                        "p.id as id, " +
+                        "p.firstName as firstName, " +
+                        "p.lastName as lastName, " +
+                        "p.email as email, " +
+                        "p.createdAt as createdAt" +
+                        ") from Person p where p.active = true"
         );
-        criteria.setResultTransformer(Criteria.ALIAS_TO_ENTITY_MAP);
-        return criteria.list();
+        return (List<Map<String, Object>>) (List<?>) query.list();
     }
 
     /**
@@ -146,16 +186,13 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findByEmailDomainUsingSqlRestriction(String emailDomain) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(
-                Restrictions.sqlRestriction(
-                        "lower({alias}.email) like ?",
-                        "%@" + emailDomain.toLowerCase(),
-                        StandardBasicTypes.STRING
-                )
+        Query<Person> query = session().createQuery(
+                "from Person p where lower(p.email) like :pattern order by p.email asc",
+                Person.class
         );
-        criteria.addOrder(Order.asc("email"));
-        return criteria.list();
+        return query
+                .setParameter("pattern", "%@" + emailDomain.toLowerCase())
+                .list();
     }
 
     /**
@@ -163,12 +200,11 @@ public class PersonRepository implements PanacheRepository<Person> {
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findPeopleCreatedAtLatestTimestamp() {
-        DetachedCriteria latestCreatedAt = DetachedCriteria.forClass(Person.class)
-                .setProjection(Projections.max("createdAt"));
-
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Subqueries.propertyEq("createdAt", latestCreatedAt));
-        return criteria.list();
+        Query<Person> query = session().createQuery(
+                "from Person p where p.createdAt = (select max(p2.createdAt) from Person p2)",
+                Person.class
+        );
+        return query.list();
     }
 
     /**
