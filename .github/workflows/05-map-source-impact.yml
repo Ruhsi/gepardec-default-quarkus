@@ -2250,7 +2250,6 @@ jobs:
           SOURCE_ROOT: ${{ runner.temp }}/dependency-head
           RESOLVED_BASE: ${{ runner.temp }}/resolved-jars/base
           RESOLVED_HEAD: ${{ runner.temp }}/resolved-jars/head
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
@@ -2260,7 +2259,7 @@ jobs:
           RESOLVED_HEAD="${RESOLVED_HEAD}" \
           MAX_JAVA_SOURCE_FILES="${MAX_JAVA_SOURCE_FILES}" \
           MAX_REMOVED_DEPENDENCY_TYPE_TARGETS="${MAX_REMOVED_DEPENDENCY_TYPE_TARGETS}" \
-          HEAD_SHA="${HEAD_SHA}" \
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}" \
           python3 <<'PY'
           import base64
           import hashlib
@@ -2549,7 +2548,27 @@ jobs:
 
           removed_dependencies = []
           removed_type_target_count = 0
+          removed_type_still_present_on_head_count = 0
           removed_inventory_failures = []
+
+          # A Maven coordinate can disappear while its classes remain available
+          # through another dependency on the upgraded HEAD classpath. Treating
+          # those classes as removed creates false source-migration impacts.
+          # Build a class-name set from the complete resolved HEAD classpath once
+          # and only emit REMOVED_DEPENDENCY_TYPE targets for types truly absent.
+          head_class_names = set()
+          head_classpath_scan_failures = []
+          if resolved_head.is_dir():
+              for head_jar in sorted(resolved_head.rglob("*.jar")):
+                  try:
+                      head_class_names.update(jar_class_names(head_jar))
+                  except (OSError, zipfile.BadZipFile) as exc:
+                      head_classpath_scan_failures.append(
+                          {
+                              "path": head_jar.relative_to(resolved_head).as_posix(),
+                              "message": str(exc),
+                          }
+                      )
 
           # 2) Removed JARs do not have a new JAR for JApiCmp. Enumerate their
           #    class names only and let the Java compiler resolve actual usages
@@ -2627,6 +2646,9 @@ jobs:
               )
 
               for class_name in class_names:
+                  if class_name in head_class_names:
+                      removed_type_still_present_on_head_count += 1
+                      continue
                   removed_type_target_count += 1
                   if removed_type_target_count > max_removed_targets:
                       raise ValueError(
@@ -2834,6 +2856,8 @@ jobs:
                   "removedDependencyTypeTargetCount": target_origin_counts.get(
                       "REMOVED_DEPENDENCY_TYPE", 0
                   ),
+                  "removedDependencyTypeStillPresentOnHeadCount": removed_type_still_present_on_head_count,
+                  "headClasspathTypeScanFailureCount": len(head_classpath_scan_failures),
                   "removedDependencyCount": len(removed_dependencies),
                   "removedDependencyInventoryFailureCount": len(
                       removed_inventory_failures
@@ -2872,6 +2896,9 @@ jobs:
                       "typeCount": sum(
                           item["classCount"] for item in removed_dependencies
                       ),
+                      "effectiveRemovedTypeTargetCount": removed_type_target_count,
+                      "stillPresentOnHeadTypeOccurrenceCount": removed_type_still_present_on_head_count,
+                      "headClasspathScanFailures": head_classpath_scan_failures,
                       "dependencies": removed_dependencies,
                       "failures": removed_inventory_failures,
                   },

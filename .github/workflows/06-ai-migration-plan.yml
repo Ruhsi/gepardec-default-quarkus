@@ -213,6 +213,76 @@ jobs:
           echo "impact_count=${impact_count}" >> "${GITHUB_OUTPUT}"
           echo "needs_ai=${needs_ai}" >> "${GITHUB_OUTPUT}"
 
+      - name: Attach exact PR source context
+        if: steps.build.outputs.needs_ai == 'true'
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PYSOURCE'
+          import base64
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          out = Path(os.environ["OUTPUT_DIR"])
+          path = out / "ai-migration-input.json"
+          evidence = json.loads(path.read_text(encoding="utf-8"))
+          repository = evidence["repository"]
+          head_sha = evidence["headSha"]
+          token = os.environ["GH_TOKEN"]
+
+          source_files = sorted({
+              usage.get("sourceFile")
+              for impact in evidence.get("impacts", [])
+              for usage in impact.get("usages", [])
+              if usage.get("sourceFile")
+          })
+          if len(source_files) > 20:
+              raise SystemExit(f"Refusing to attach more than 20 source files; found {len(source_files)}")
+
+          contexts = []
+          total_bytes = 0
+          for source_file in source_files:
+              encoded_path = urllib.parse.quote(source_file, safe="/")
+              url = f"https://api.github.com/repos/{repository}/contents/{encoded_path}?ref={head_sha}"
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "renovate-ai-migration-planner",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+              except Exception as exc:
+                  raise SystemExit(f"Unable to fetch exact PR source {source_file}@{head_sha}: {exc}")
+
+              encoded = payload.get("content")
+              if not isinstance(encoded, str):
+                  raise SystemExit(f"GitHub contents API returned no inline content for {source_file}")
+              content = base64.b64decode(encoded).decode("utf-8", errors="replace")
+              raw_size = len(content.encode("utf-8"))
+              if raw_size > 100_000:
+                  raise SystemExit(f"Source context {source_file} exceeds 100 KB")
+              total_bytes += raw_size
+              if total_bytes > 400_000:
+                  raise SystemExit("Combined source context exceeds 400 KB")
+              contexts.append({"path": source_file, "sha": payload.get("sha", ""), "content": content})
+
+          evidence["sourceContexts"] = contexts
+          path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"Attached {len(contexts)} exact PR source file(s), {total_bytes} bytes")
+          PYSOURCE
+
       - name: Set up Node.js for Copilot CLI
         if: steps.build.outputs.needs_ai == 'true'
         uses: actions/setup-node@v7
@@ -234,6 +304,7 @@ jobs:
           OUTPUT_DIR: ${{ runner.temp }}/ai-migration-plan
           MODEL: ${{ env.COPILOT_MODEL }}
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PLANNER: .github/scripts/ai-migration-planner.py
         run: |
           set -euo pipefail
 
@@ -246,23 +317,20 @@ jobs:
           import json
           import os
           from pathlib import Path
-
           out = Path(os.environ["OUTPUT_DIR"])
           evidence = json.loads((out / "ai-migration-input.json").read_text(encoding="utf-8"))
           schema = json.loads((out / "ai-migration-output-schema.json").read_text(encoding="utf-8"))
           instructions = (out / "ai-migration-instructions.txt").read_text(encoding="utf-8").strip()
-
-          prompt = f"""{instructions}
-
-          IMPORTANT OUTPUT CONTRACT:
-          Return ONLY one JSON object. Do not use Markdown fences, prose, explanations, or tool calls.
-          The JSON must conform exactly to this JSON Schema:
-          {json.dumps(schema, sort_keys=True)}
-
-          Return exactly one decision for every supplied impactId and no others.
-          Migration evidence JSON follows:
-          {json.dumps(evidence, sort_keys=True)}
-          """
+          prompt = (
+              instructions
+              + "\n\nIMPORTANT OUTPUT CONTRACT:\n"
+              + "Return ONLY one JSON object. No Markdown fences, prose, explanations, or tool calls.\n"
+              + "The JSON must conform exactly to this JSON Schema:\n"
+              + json.dumps(schema, sort_keys=True)
+              + "\n\nMigration evidence JSON follows:\n"
+              + json.dumps(evidence, sort_keys=True)
+              + "\n"
+          )
           (out / "copilot-initial-prompt.txt").write_text(prompt, encoding="utf-8")
           PYPROMPT
 
@@ -270,8 +338,6 @@ jobs:
           stderr_file="${OUTPUT_DIR}/copilot-initial-stderr.txt"
           raw_file="${OUTPUT_DIR}/ai-migration-plan-raw.json"
 
-          # JSONL mode is important here: silent/text mode is terminal-rendered and can
-          # insert line wrapping / lose escaping, which corrupts JSON-shaped model output.
           set +e
           copilot \
             -p "$(cat "${OUTPUT_DIR}/copilot-initial-prompt.txt")" \
@@ -286,46 +352,16 @@ jobs:
           set -e
 
           echo "Copilot initial exit code: ${copilot_exit}"
-          if [[ -s "${stderr_file}" ]]; then
-            echo "Copilot stderr (diagnostic):"
-            cat "${stderr_file}"
-          fi
+          if [[ -s "${stderr_file}" ]]; then cat "${stderr_file}"; fi
 
           python3 - "${response_file}" "${raw_file}" "${copilot_exit}" <<'PYEXTRACT'
           import json
           import re
           import sys
           from pathlib import Path
-
-          src = Path(sys.argv[1])
-          dst = Path(sys.argv[2])
-          cli_exit = int(sys.argv[3])
-
-          if not src.exists() or src.stat().st_size == 0:
-              raise SystemExit(f"Copilot returned no JSONL events (exit {cli_exit})")
-
+          src, dst, cli_exit = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
           messages = []
-          malformed_lines = 0
-          for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
-              if not line.strip():
-                  continue
-              try:
-                  event = json.loads(line)
-              except json.JSONDecodeError:
-                  malformed_lines += 1
-                  continue
-              if not isinstance(event, dict):
-                  continue
-              event_type = str(event.get("type", ""))
-              data = event.get("data")
-              if event_type == "assistant.message" and isinstance(data, dict):
-                  content = data.get("content")
-                  if isinstance(content, str) and content.strip():
-                      messages.append(content.strip())
-
-          # Be tolerant of CLI envelope changes: inspect JSON objects recursively for
-          # assistant.message-like objects with data.content.
-          if not messages:
+          if src.exists():
               for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
                   try:
                       root = json.loads(line)
@@ -344,21 +380,14 @@ jobs:
                           stack.extend(cur.values())
                       elif isinstance(cur, list):
                           stack.extend(cur)
-
           if not messages:
-              raise SystemExit(
-                  f"Copilot JSONL contained no assistant.message content "
-                  f"(exit {cli_exit}, malformed lines {malformed_lines})"
-              )
-
+              raise SystemExit(f"Copilot JSONL contained no assistant.message content (exit {cli_exit})")
           text = messages[-1]
           candidates = [text]
           candidates.extend(re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I))
-          first = text.find("{")
-          last = text.rfind("}")
+          first, last = text.find("{"), text.rfind("}")
           if first >= 0 and last > first:
               candidates.append(text[first:last + 1])
-
           for candidate in candidates:
               try:
                   obj = json.loads(candidate)
@@ -369,13 +398,12 @@ jobs:
                   print(f"Extracted migration plan from Copilot JSONL (CLI exit {cli_exit})")
                   break
           else:
-              preview = text[:500].replace("\n", "\\n")
-              raise SystemExit(
-                  "Copilot assistant.message was captured safely but did not contain valid JSON. "
-                  f"Preview: {preview}"
-              )
+              raise SystemExit("Copilot assistant.message did not contain valid JSON")
           PYEXTRACT
 
+          python3 "${PLANNER}" normalize \
+            --input "${OUTPUT_DIR}/ai-migration-input.json" \
+            --raw-plan "${raw_file}"
           jq -e . "${raw_file}" >/dev/null
 
       - name: Validate initial plan and perform at most one Copilot repair request
@@ -390,91 +418,48 @@ jobs:
           set -euo pipefail
 
           check_file="${OUTPUT_DIR}/ai-migration-repair-check.json"
-          python3 "${PLANNER}" check \
-            --input "${OUTPUT_DIR}/ai-migration-input.json" \
-            --raw-plan "${OUTPUT_DIR}/ai-migration-plan-raw.json" \
-            --report "${check_file}"
+          raw_file="${OUTPUT_DIR}/ai-migration-plan-raw.json"
+          python3 "${PLANNER}" check --input "${OUTPUT_DIR}/ai-migration-input.json" --raw-plan "${raw_file}" --report "${check_file}"
 
           if [[ "$(jq -r '.valid' "${check_file}")" == "true" ]]; then
             echo "Initial Copilot plan is machine-actionable; no repair request required."
             exit 0
           fi
 
-          if [[ "$(jq '.globalErrors | length' "${check_file}")" -gt 0 ]]; then
-            echo "::error::Initial Copilot plan has global structural errors; refusing an exploratory retry."
-            jq . "${check_file}"
-            exit 1
-          fi
-
-          invalid_count="$(jq '.invalidImpacts | length' "${check_file}")"
-          if [[ "${invalid_count}" -eq 0 ]]; then
-            echo "::error::Initial Copilot plan is invalid but contains no repairable impacts."
-            jq . "${check_file}"
-            exit 1
-          fi
-
-          echo "Initial plan has ${invalid_count} invalid impact(s); issuing the single allowed Copilot repair request."
+          echo "Initial plan is invalid; issuing the single allowed whole-plan repair request."
+          jq . "${check_file}"
 
           python3 <<'PYREPAIR'
           import json
           import os
           from pathlib import Path
-
           out = Path(os.environ["OUTPUT_DIR"])
           evidence = json.loads((out / "ai-migration-input.json").read_text(encoding="utf-8"))
           schema = json.loads((out / "ai-migration-output-schema.json").read_text(encoding="utf-8"))
-          base_instructions = (out / "ai-migration-instructions.txt").read_text(encoding="utf-8").strip()
-          check = json.loads((out / "ai-migration-repair-check.json").read_text(encoding="utf-8"))
-          raw_plan = json.loads((out / "ai-migration-plan-raw.json").read_text(encoding="utf-8"))
-
-          impact_by_id = {i["impactId"]: i for i in evidence.get("impacts", [])}
-          previous_by_id = {
-              d.get("impactId"): d for d in raw_plan.get("decisions", [])
-              if isinstance(d, dict) and d.get("impactId")
-          }
-          invalid = check.get("invalidImpacts", [])
-          invalid_ids = [item["impactId"] for item in invalid]
-
-          repair_evidence = dict(evidence)
-          repair_evidence["impactCount"] = len(invalid_ids)
-          repair_evidence["impacts"] = [impact_by_id[i] for i in invalid_ids]
-          repair_evidence["repairContext"] = [
-              {
-                  "impactId": item["impactId"],
-                  "validationErrors": item.get("errors", []),
-                  "previousDecision": previous_by_id.get(item["impactId"]),
-              }
-              for item in invalid
-          ]
-
-          prompt = f"""{base_instructions}
-
-          REPAIR MODE - THIS IS THE ONLY REPAIR REQUEST:
-          Return ONLY one JSON object, with no Markdown or prose.
-          Return one corrected decision for EVERY supplied impactId and for NO OTHER impactId.
-          Fix EVERY validationErrors entry. Preserve valid parts of the previous decision where useful.
-          The result must pass machine validation without another AI call.
-          For REWRITE, recipeKind must be CHANGE_METHOD_NAME, INLINE_METHOD_CALLS, or CUSTOM_JAVA_TEMPLATE.
-          CHANGE_METHOD_NAME requires methodPattern and newMethodName.
-          INLINE_METHOD_CALLS and CUSTOM_JAVA_TEMPLATE require methodPattern and replacement.
-          Never use recipeKind NONE for REWRITE.
-          Method patterns use OpenRewrite MethodMatcher syntax, for example 'org.hibernate.Session createCriteria(java.lang.Class)'.
-          Placeholder arity is strict: () allows no #{{pN}}; (A) allows only #{{p0}}; (A,B) allows only #{{p0}} and #{{p1}}.
-          For exact evidence-backed javax.* -> jakarta.* replacements, use the supplied jakarta candidate and never an unrelated same-simple-name type.
-
-          The JSON must conform exactly to this JSON Schema:
-          {json.dumps(schema, sort_keys=True)}
-
-          Repair evidence JSON follows:
-          {json.dumps(repair_evidence, sort_keys=True)}
-          """
+          instructions = (out / "ai-migration-instructions.txt").read_text(encoding="utf-8").strip()
+          previous = json.loads((out / "ai-migration-plan-raw.json").read_text(encoding="utf-8"))
+          validation = json.loads((out / "ai-migration-repair-check.json").read_text(encoding="utf-8"))
+          prompt = (
+              instructions
+              + "\n\nREPAIR MODE - THIS IS THE ONLY REPAIR REQUEST.\n"
+              + "Return a COMPLETE replacement plan for ALL impacts, not only the invalid ones.\n"
+              + "Fix every validation error. Keep valid decisions and shared rewrite units where appropriate.\n"
+              + "Re-evaluate rewrite granularity from sourceMethodGroups and exact source context. "
+              + "If several affected APIs in one application method are semantically coupled, use one shared REPLACE_METHOD_BODY unit; "
+              + "otherwise keep the smallest safe independent rewrite units.\n"
+              + "Return ONLY one JSON object conforming exactly to this schema:\n"
+              + json.dumps(schema, sort_keys=True)
+              + "\n\nVALIDATION ERRORS:\n" + json.dumps(validation, sort_keys=True)
+              + "\n\nPREVIOUS PLAN:\n" + json.dumps(previous, sort_keys=True)
+              + "\n\nFULL MIGRATION EVIDENCE INCLUDING SOURCE CONTEXT:\n" + json.dumps(evidence, sort_keys=True)
+              + "\n"
+          )
           (out / "copilot-repair-prompt.txt").write_text(prompt, encoding="utf-8")
           PYREPAIR
 
-          response_file="${OUTPUT_DIR}/copilot-repair-events.jsonl"
+          events="${OUTPUT_DIR}/copilot-repair-events.jsonl"
           stderr_file="${OUTPUT_DIR}/copilot-repair-stderr.txt"
-          repaired_file="${OUTPUT_DIR}/copilot-repair-raw-plan.json"
-
+          repaired="${OUTPUT_DIR}/copilot-repair-raw-plan.json"
           set +e
           copilot \
             -p "$(cat "${OUTPUT_DIR}/copilot-repair-prompt.txt")" \
@@ -484,111 +469,60 @@ jobs:
             --no-color \
             --no-auto-update \
             --output-format=json \
-            > "${response_file}" 2> "${stderr_file}"
+            > "${events}" 2> "${stderr_file}"
           copilot_exit=$?
           set -e
-
           echo "Copilot repair exit code: ${copilot_exit}"
-          if [[ -s "${stderr_file}" ]]; then
-            echo "Copilot repair stderr (diagnostic):"
-            cat "${stderr_file}"
-          fi
+          if [[ -s "${stderr_file}" ]]; then cat "${stderr_file}"; fi
 
-          python3 - "${response_file}" "${repaired_file}" "${copilot_exit}" <<'PYEXTRACT'
+          python3 - "${events}" "${repaired}" "${copilot_exit}" <<'PYEXTRACT'
           import json
           import re
           import sys
           from pathlib import Path
-
-          src = Path(sys.argv[1])
-          dst = Path(sys.argv[2])
-          cli_exit = int(sys.argv[3])
+          src, dst, cli_exit = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
           messages = []
-
-          for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
-              if not line.strip():
-                  continue
-              try:
-                  event = json.loads(line)
-              except json.JSONDecodeError:
-                  continue
-              if not isinstance(event, dict):
-                  continue
-              if event.get("type") == "assistant.message" and isinstance(event.get("data"), dict):
-                  content = event["data"].get("content")
-                  if isinstance(content, str) and content.strip():
-                      messages.append(content.strip())
-
+          if src.exists():
+              for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
+                  try:
+                      root = json.loads(line)
+                  except Exception:
+                      continue
+                  stack = [root]
+                  while stack:
+                      cur = stack.pop()
+                      if isinstance(cur, dict):
+                          if "assistant.message" in str(cur.get("type", "")) and isinstance(cur.get("data"), dict):
+                              content = cur["data"].get("content")
+                              if isinstance(content, str) and content.strip(): messages.append(content.strip())
+                          stack.extend(cur.values())
+                      elif isinstance(cur, list): stack.extend(cur)
           if not messages:
               raise SystemExit(f"Copilot repair JSONL contained no assistant.message content (exit {cli_exit})")
-
           text = messages[-1]
           candidates = [text]
           candidates.extend(re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I))
-          first = text.find("{")
-          last = text.rfind("}")
-          if first >= 0 and last > first:
-              candidates.append(text[first:last + 1])
-
+          first, last = text.find("{"), text.rfind("}")
+          if first >= 0 and last > first: candidates.append(text[first:last + 1])
           for candidate in candidates:
-              try:
-                  obj = json.loads(candidate)
-              except json.JSONDecodeError:
-                  continue
+              try: obj = json.loads(candidate)
+              except json.JSONDecodeError: continue
               if isinstance(obj, dict):
                   dst.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-                  print(f"Extracted repaired plan from Copilot JSONL (CLI exit {cli_exit})")
                   break
           else:
               raise SystemExit("Copilot repair assistant.message did not contain valid JSON")
           PYEXTRACT
 
-          python3 <<'PYMERGE'
-          import json
-          import os
-          from pathlib import Path
-
-          out = Path(os.environ["OUTPUT_DIR"])
-          raw_path = out / "ai-migration-plan-raw.json"
-          combined = json.loads(raw_path.read_text(encoding="utf-8"))
-          check = json.loads((out / "ai-migration-repair-check.json").read_text(encoding="utf-8"))
-          repaired = json.loads((out / "copilot-repair-raw-plan.json").read_text(encoding="utf-8"))
-
-          expected = {item["impactId"] for item in check.get("invalidImpacts", [])}
-          replacements = {}
-          for decision in repaired.get("decisions", []):
-              impact_id = decision.get("impactId")
-              if impact_id not in expected:
-                  raise SystemExit(f"Repair response returned unexpected impactId {impact_id}")
-              if impact_id in replacements:
-                  raise SystemExit(f"Repair response duplicated impactId {impact_id}")
-              replacements[impact_id] = decision
-
-          missing = sorted(expected - set(replacements))
-          if missing:
-              raise SystemExit("Repair response missed impactIds: " + ", ".join(missing))
-
-          decisions = {
-              d.get("impactId"): d for d in combined.get("decisions", [])
-              if isinstance(d, dict) and d.get("impactId")
-          }
-          decisions.update(replacements)
-          combined["decisions"] = [decisions[k] for k in sorted(decisions)]
-          combined["summary"] = (combined.get("summary") or "") + f" | single Copilot repair: {len(replacements)} decision(s) corrected"
-          raw_path.write_text(json.dumps(combined, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-          PYMERGE
-
-          python3 "${PLANNER}" check \
-            --input "${OUTPUT_DIR}/ai-migration-input.json" \
-            --raw-plan "${OUTPUT_DIR}/ai-migration-plan-raw.json" \
-            --report "${check_file}"
+          cp "${repaired}" "${raw_file}"
+          python3 "${PLANNER}" normalize --input "${OUTPUT_DIR}/ai-migration-input.json" --raw-plan "${raw_file}"
+          python3 "${PLANNER}" check --input "${OUTPUT_DIR}/ai-migration-input.json" --raw-plan "${raw_file}" --report "${check_file}"
 
           if [[ "$(jq -r '.valid' "${check_file}")" != "true" ]]; then
             echo "::error::AI plan is still not machine-actionable after the single Copilot repair request."
             jq . "${check_file}"
             exit 1
           fi
-
           echo "AI plan is machine-actionable after one Copilot repair request."
 
       - name: Validate and enrich AI migration plan
