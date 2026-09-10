@@ -2250,6 +2250,7 @@ jobs:
           SOURCE_ROOT: ${{ runner.temp }}/dependency-head
           RESOLVED_BASE: ${{ runner.temp }}/resolved-jars/base
           RESOLVED_HEAD: ${{ runner.temp }}/resolved-jars/head
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
@@ -2259,7 +2260,7 @@ jobs:
           RESOLVED_HEAD="${RESOLVED_HEAD}" \
           MAX_JAVA_SOURCE_FILES="${MAX_JAVA_SOURCE_FILES}" \
           MAX_REMOVED_DEPENDENCY_TYPE_TARGETS="${MAX_REMOVED_DEPENDENCY_TYPE_TARGETS}" \
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}" \
+          HEAD_SHA="${HEAD_SHA}" \
           python3 <<'PY'
           import base64
           import hashlib
