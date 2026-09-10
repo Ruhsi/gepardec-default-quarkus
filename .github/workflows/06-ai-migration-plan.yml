@@ -266,20 +266,32 @@ jobs:
           (out / "copilot-initial-prompt.txt").write_text(prompt, encoding="utf-8")
           PYPROMPT
 
-          response_file="${OUTPUT_DIR}/copilot-initial-response.txt"
+          response_file="${OUTPUT_DIR}/copilot-initial-events.jsonl"
+          stderr_file="${OUTPUT_DIR}/copilot-initial-stderr.txt"
           raw_file="${OUTPUT_DIR}/ai-migration-plan-raw.json"
 
+          # JSONL mode is important here: silent/text mode is terminal-rendered and can
+          # insert line wrapping / lose escaping, which corrupts JSON-shaped model output.
+          set +e
           copilot \
             -p "$(cat "${OUTPUT_DIR}/copilot-initial-prompt.txt")" \
-            -s \
             --model "${MODEL}" \
             --no-ask-user \
             --no-custom-instructions \
             --no-color \
-            --stream off \
-            > "${response_file}"
+            --no-auto-update \
+            --output-format=json \
+            > "${response_file}" 2> "${stderr_file}"
+          copilot_exit=$?
+          set -e
 
-          python3 - "${response_file}" "${raw_file}" <<'PYEXTRACT'
+          echo "Copilot initial exit code: ${copilot_exit}"
+          if [[ -s "${stderr_file}" ]]; then
+            echo "Copilot stderr (diagnostic):"
+            cat "${stderr_file}"
+          fi
+
+          python3 - "${response_file}" "${raw_file}" "${copilot_exit}" <<'PYEXTRACT'
           import json
           import re
           import sys
@@ -287,13 +299,61 @@ jobs:
 
           src = Path(sys.argv[1])
           dst = Path(sys.argv[2])
-          text = src.read_text(encoding="utf-8").strip()
-          if not text:
-              raise SystemExit("Copilot returned an empty response")
+          cli_exit = int(sys.argv[3])
 
+          if not src.exists() or src.stat().st_size == 0:
+              raise SystemExit(f"Copilot returned no JSONL events (exit {cli_exit})")
+
+          messages = []
+          malformed_lines = 0
+          for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
+              if not line.strip():
+                  continue
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  malformed_lines += 1
+                  continue
+              if not isinstance(event, dict):
+                  continue
+              event_type = str(event.get("type", ""))
+              data = event.get("data")
+              if event_type == "assistant.message" and isinstance(data, dict):
+                  content = data.get("content")
+                  if isinstance(content, str) and content.strip():
+                      messages.append(content.strip())
+
+          # Be tolerant of CLI envelope changes: inspect JSON objects recursively for
+          # assistant.message-like objects with data.content.
+          if not messages:
+              for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
+                  try:
+                      root = json.loads(line)
+                  except Exception:
+                      continue
+                  stack = [root]
+                  while stack:
+                      cur = stack.pop()
+                      if isinstance(cur, dict):
+                          typ = str(cur.get("type", ""))
+                          data = cur.get("data")
+                          if "assistant.message" in typ and isinstance(data, dict):
+                              content = data.get("content")
+                              if isinstance(content, str) and content.strip():
+                                  messages.append(content.strip())
+                          stack.extend(cur.values())
+                      elif isinstance(cur, list):
+                          stack.extend(cur)
+
+          if not messages:
+              raise SystemExit(
+                  f"Copilot JSONL contained no assistant.message content "
+                  f"(exit {cli_exit}, malformed lines {malformed_lines})"
+              )
+
+          text = messages[-1]
           candidates = [text]
-          fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I)
-          candidates.extend(fenced)
+          candidates.extend(re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I))
           first = text.find("{")
           last = text.rfind("}")
           if first >= 0 and last > first:
@@ -306,9 +366,14 @@ jobs:
                   continue
               if isinstance(obj, dict):
                   dst.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                  print(f"Extracted migration plan from Copilot JSONL (CLI exit {cli_exit})")
                   break
           else:
-              raise SystemExit("Copilot response did not contain a valid JSON object")
+              preview = text[:500].replace("\n", "\\n")
+              raise SystemExit(
+                  "Copilot assistant.message was captured safely but did not contain valid JSON. "
+                  f"Preview: {preview}"
+              )
           PYEXTRACT
 
           jq -e . "${raw_file}" >/dev/null
@@ -406,33 +471,65 @@ jobs:
           (out / "copilot-repair-prompt.txt").write_text(prompt, encoding="utf-8")
           PYREPAIR
 
-          response_file="${OUTPUT_DIR}/copilot-repair-response.txt"
+          response_file="${OUTPUT_DIR}/copilot-repair-events.jsonl"
+          stderr_file="${OUTPUT_DIR}/copilot-repair-stderr.txt"
           repaired_file="${OUTPUT_DIR}/copilot-repair-raw-plan.json"
 
+          set +e
           copilot \
             -p "$(cat "${OUTPUT_DIR}/copilot-repair-prompt.txt")" \
-            -s \
             --model "${MODEL}" \
             --no-ask-user \
             --no-custom-instructions \
             --no-color \
-            --stream off \
-            > "${response_file}"
+            --no-auto-update \
+            --output-format=json \
+            > "${response_file}" 2> "${stderr_file}"
+          copilot_exit=$?
+          set -e
 
-          python3 - "${response_file}" "${repaired_file}" <<'PYEXTRACT'
+          echo "Copilot repair exit code: ${copilot_exit}"
+          if [[ -s "${stderr_file}" ]]; then
+            echo "Copilot repair stderr (diagnostic):"
+            cat "${stderr_file}"
+          fi
+
+          python3 - "${response_file}" "${repaired_file}" "${copilot_exit}" <<'PYEXTRACT'
           import json
           import re
           import sys
           from pathlib import Path
 
-          text = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+          src = Path(sys.argv[1])
           dst = Path(sys.argv[2])
+          cli_exit = int(sys.argv[3])
+          messages = []
+
+          for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
+              if not line.strip():
+                  continue
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if not isinstance(event, dict):
+                  continue
+              if event.get("type") == "assistant.message" and isinstance(event.get("data"), dict):
+                  content = event["data"].get("content")
+                  if isinstance(content, str) and content.strip():
+                      messages.append(content.strip())
+
+          if not messages:
+              raise SystemExit(f"Copilot repair JSONL contained no assistant.message content (exit {cli_exit})")
+
+          text = messages[-1]
           candidates = [text]
           candidates.extend(re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I))
           first = text.find("{")
           last = text.rfind("}")
           if first >= 0 and last > first:
               candidates.append(text[first:last + 1])
+
           for candidate in candidates:
               try:
                   obj = json.loads(candidate)
@@ -440,9 +537,10 @@ jobs:
                   continue
               if isinstance(obj, dict):
                   dst.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                  print(f"Extracted repaired plan from Copilot JSONL (CLI exit {cli_exit})")
                   break
           else:
-              raise SystemExit("Copilot repair response did not contain a valid JSON object")
+              raise SystemExit("Copilot repair assistant.message did not contain valid JSON")
           PYEXTRACT
 
           python3 <<'PYMERGE'
