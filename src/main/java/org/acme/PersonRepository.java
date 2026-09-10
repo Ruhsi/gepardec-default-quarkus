@@ -1,7 +1,6 @@
 package org.acme;
 
 import io.quarkus.hibernate.orm.panache.PanacheRepository;
-import org.hibernate.Criteria;
 import org.hibernate.LockMode;
 import org.hibernate.Session;
 import org.hibernate.query.Query;
