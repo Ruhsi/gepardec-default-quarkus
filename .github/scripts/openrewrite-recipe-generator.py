@@ -119,7 +119,7 @@ def normalize(plan):
             'unitId': unit_id,
             'coversImpactIds': sorted(set(unit.get('coversImpactIds') or [])),
             'kind': kind,
-            'methodPattern': unit['methodPattern'],
+            'methodPattern': unit.get('methodPattern'),
             'replacement': unit.get('replacement'),
             'newMethodName': unit.get('newMethodName'),
             'imports': sorted(set(unit.get('imports') or [])),
@@ -147,8 +147,8 @@ def normalize(plan):
                 if isinstance(u, dict) and u.get('usageKind')
             }
             if kind == 'REMOVE_IMPORT':
-                if not usage_kinds or usage_kinds - {'TYPE_IMPORT'}:
-                    fail(f'{unit_id}: REMOVE_IMPORT may only cover TYPE_IMPORT-only impacts, got {sorted(usage_kinds)}')
+                if 'TYPE_IMPORT' not in usage_kinds:
+                    fail(f'{unit_id}: REMOVE_IMPORT requires TYPE_IMPORT evidence for the covered impact, got {sorted(usage_kinds)}')
                 target_symbol = (decision.get('target') or {}).get('symbol')
                 if target_symbol and item['typeName'] != target_symbol:
                     fail(f'{unit_id}: REMOVE_IMPORT typeName {item["typeName"]} does not match covered target {target_symbol}')
@@ -422,7 +422,7 @@ def main():
 
     manifest = {
         'schemaVersion': 5,
-        'generator': 'openrewrite-recipe-generator-v16.py',
+        'generator': 'openrewrite-recipe-generator-v16.3.py',
         'input': {'path': plan_path.name, 'sha256': hashlib.sha256(plan_path.read_bytes()).hexdigest()},
         'output': {'path': Path(args.recipe).name, 'sha256': hashlib.sha256(recipe.encode()).hexdigest(), 'recipeName': args.recipe_name},
         'customRecipe': {
