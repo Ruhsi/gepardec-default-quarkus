@@ -150,50 +150,32 @@ public class PersonRepository implements PanacheRepository<Person> {
     }
 
     /**
-     * Intentionally legacy Hibernate Criteria API.
-     *
-     * This is exactly the kind of API migration we want the pipeline
-     * to detect when moving from Hibernate 5.6 to Hibernate 6.
+     * Legacy Hibernate Criteria API (verfuegbar in Hibernate 5.6.x).
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findUsingLegacyCriteria(String lastName) {
-        Session session = entityManager.unwrap(Session.class);
-
-        Criteria criteria = session.createCriteria(Person.class);
-
-        criteria.add(
-                org.hibernate.criterion.Restrictions.eq(
-                        "lastName",
-                        lastName
-                )
-        );
-
-        return criteria.list();
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+        CriteriaQuery<Person> cq = cb.createQuery(Person.class);
+        Root<Person> root = cq.from(Person.class);
+        cq.select(root).where(cb.equal(root.get("lastName"), lastName));
+        TypedQuery<Person> query = entityManager.createQuery(cq);
+        return query.getResultList();
     }
 
     /**
-     * Another legacy Criteria use case with ordering and limit.
+     * Legacy Criteria use case with ordering and limit.
      */
     @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findLatestUsingLegacyCriteria() {
-        Session session = entityManager.unwrap(Session.class);
-
-        Criteria criteria = session.createCriteria(Person.class);
-
-        criteria.add(
-                org.hibernate.criterion.Restrictions.eq(
-                        "active",
-                        true
-                )
-        );
-
-        criteria.addOrder(
-                org.hibernate.criterion.Order.desc("createdAt")
-        );
-
-        criteria.setMaxResults(10);
-
-        return criteria.list();
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+        CriteriaQuery<Person> cq = cb.createQuery(Person.class);
+        Root<Person> root = cq.from(Person.class);
+        cq.select(root)
+                .where(cb.equal(root.get("active"), true))
+                .orderBy(cb.desc(root.get("createdAt")));
+        TypedQuery<Person> query = entityManager.createQuery(cq);
+        query.setMaxResults(10);
+        return query.getResultList();
     }
 
     /**
