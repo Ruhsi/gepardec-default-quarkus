@@ -340,13 +340,13 @@ jobs:
 
           set +e
           copilot \
-            -p "$(cat "${OUTPUT_DIR}/copilot-initial-prompt.txt")" \
             --model "${MODEL}" \
             --no-ask-user \
             --no-custom-instructions \
             --no-color \
             --no-auto-update \
             --output-format=json \
+            < "${OUTPUT_DIR}/copilot-initial-prompt.txt" \
             > "${response_file}" 2> "${stderr_file}"
           copilot_exit=$?
           set -e
@@ -439,6 +439,16 @@ jobs:
           instructions = (out / "ai-migration-instructions.txt").read_text(encoding="utf-8").strip()
           previous = json.loads((out / "ai-migration-plan-raw.json").read_text(encoding="utf-8"))
           validation = json.loads((out / "ai-migration-repair-check.json").read_text(encoding="utf-8"))
+          # The validation report embeds previousDecision objects. The complete previous
+          # plan is already included below, so send only the actual validation errors to
+          # avoid duplicating a potentially large plan in the repair prompt.
+          compact_validation = {
+              "globalErrors": validation.get("globalErrors", []),
+              "invalidImpacts": [
+                  {"impactId": item.get("impactId"), "errors": item.get("errors", [])}
+                  for item in validation.get("invalidImpacts", [])
+              ],
+          }
           prompt = (
               instructions
               + "\n\nREPAIR MODE - THIS IS THE ONLY REPAIR REQUEST.\n"
@@ -449,7 +459,7 @@ jobs:
               + "otherwise keep the smallest safe independent rewrite units.\n"
               + "Return ONLY one JSON object conforming exactly to this schema:\n"
               + json.dumps(schema, sort_keys=True)
-              + "\n\nVALIDATION ERRORS:\n" + json.dumps(validation, sort_keys=True)
+              + "\n\nVALIDATION ERRORS:\n" + json.dumps(compact_validation, sort_keys=True)
               + "\n\nPREVIOUS PLAN:\n" + json.dumps(previous, sort_keys=True)
               + "\n\nFULL MIGRATION EVIDENCE INCLUDING SOURCE CONTEXT:\n" + json.dumps(evidence, sort_keys=True)
               + "\n"
@@ -462,13 +472,13 @@ jobs:
           repaired="${OUTPUT_DIR}/copilot-repair-raw-plan.json"
           set +e
           copilot \
-            -p "$(cat "${OUTPUT_DIR}/copilot-repair-prompt.txt")" \
             --model "${MODEL}" \
             --no-ask-user \
             --no-custom-instructions \
             --no-color \
             --no-auto-update \
             --output-format=json \
+            < "${OUTPUT_DIR}/copilot-repair-prompt.txt" \
             > "${events}" 2> "${stderr_file}"
           copilot_exit=$?
           set -e
