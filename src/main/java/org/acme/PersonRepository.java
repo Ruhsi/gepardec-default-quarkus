@@ -1,27 +1,24 @@
 package org.acme;
 
 import io.quarkus.hibernate.orm.panache.PanacheRepository;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.Tuple;
+import jakarta.persistence.criteria.CriteriaBuilder;
+import jakarta.persistence.criteria.CriteriaQuery;
+import jakarta.persistence.criteria.Predicate;
+import jakarta.persistence.criteria.Root;
 import jakarta.transaction.Transactional;
-import org.hibernate.Criteria;
 import org.hibernate.LockMode;
 import org.hibernate.LockOptions;
 import org.hibernate.Session;
-import org.hibernate.criterion.DetachedCriteria;
-import org.hibernate.criterion.Example;
-import org.hibernate.criterion.MatchMode;
-import org.hibernate.criterion.Order;
-import org.hibernate.criterion.Projections;
-import org.hibernate.criterion.Restrictions;
-import org.hibernate.criterion.Subqueries;
-import org.hibernate.query.Query;
-import org.hibernate.type.StandardBasicTypes;
-
-import javax.enterprise.context.ApplicationScoped;
-import javax.inject.Inject;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 
@@ -31,9 +28,6 @@ public class PersonRepository implements PanacheRepository<Person> {
     @Inject
     EntityManager entityManager;
 
-    /**
-     * Bridge from JPA to the Hibernate 5 Session API.
-     */
     public Session getHibernateSession() {
         return entityManager.unwrap(Session.class);
     }
@@ -42,196 +36,128 @@ public class PersonRepository implements PanacheRepository<Person> {
         return getHibernateSession();
     }
 
-    /**
-     * Hibernate 5 classic Criteria API.
-     * In Hibernate 6, Session#createCriteria and org.hibernate.Criteria are gone.
-     */
-    @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findByLastNameUsingClassicCriteria(String lastName) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("lastName", lastName));
-        criteria.addOrder(Order.asc("firstName"));
-        return criteria.list();
+        return session().createSelectionQuery(
+                "from Person where lastName = :lastName order by firstName", Person.class)
+                .setParameter("lastName", lastName)
+                .getResultList();
     }
 
-    /**
-     * Old Hibernate 5 uniqueResult pattern.
-     */
-    @SuppressWarnings("deprecation")
     public Optional<Person> findByEmailUsingClassicCriteria(String email) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("email", email));
-        criteria.setMaxResults(1);
-        return Optional.ofNullable((Person) criteria.uniqueResult());
+        return session().createSelectionQuery("from Person where email = :email", Person.class)
+                .setParameter("email", email)
+                .setMaxResults(1)
+                .uniqueResultOptional();
     }
 
-    /**
-     * Criteria + MatchMode/ilike is another legacy Hibernate 5 pattern.
-     */
-    @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findActiveByCityIgnoringCase(String city) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("active", true));
-        criteria.add(Restrictions.ilike("city", city, MatchMode.EXACT));
-        criteria.addOrder(Order.desc("createdAt"));
-        return criteria.list();
+        return session().createSelectionQuery(
+                "from Person where active = true and city ilike :city order by createdAt desc", Person.class)
+                .setParameter("city", city)
+                .getResultList();
     }
 
     /**
-     * Example queries are Hibernate-5 specific and were removed from Hibernate 6.
+     * Matches non-null string properties by case-insensitive prefix, as Hibernate Example did.
      */
-    @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findByExampleUsingHibernateExample(Person probe) {
-        Criteria criteria = session().createCriteria(Person.class);
-
-        Example example = Example.create(probe)
-                .excludeZeroes()
-                .excludeProperty("id")
-                .excludeProperty("version")
-                .excludeProperty("createdAt")
-                .excludeProperty("active")
-                .ignoreCase()
-                .enableLike(MatchMode.START);
-
-        criteria.add(example);
-        criteria.addOrder(Order.asc("lastName"));
-        criteria.addOrder(Order.asc("firstName"));
-        return criteria.list();
+        CriteriaBuilder builder = entityManager.getCriteriaBuilder();
+        CriteriaQuery<Person> query = builder.createQuery(Person.class);
+        Root<Person> person = query.from(Person.class);
+        List<Predicate> predicates = new ArrayList<>();
+        addPrefixPredicate(builder, person, predicates, "firstName", probe.firstName);
+        addPrefixPredicate(builder, person, predicates, "lastName", probe.lastName);
+        addPrefixPredicate(builder, person, predicates, "email", probe.email);
+        addPrefixPredicate(builder, person, predicates, "city", probe.city);
+        query.select(person).where(predicates.toArray(new Predicate[0]))
+                .orderBy(builder.asc(person.get("lastName")), builder.asc(person.get("firstName")));
+        return entityManager.createQuery(query).getResultList();
     }
 
-    /**
-     * Legacy Criteria with order + limit.
-     */
-    @SuppressWarnings({"deprecation", "unchecked"})
+    private void addPrefixPredicate(CriteriaBuilder builder, Root<Person> person,
+                                    List<Predicate> predicates, String property, String value) {
+        if (value != null) {
+            predicates.add(builder.like(builder.lower(person.get(property)), value.toLowerCase(Locale.ROOT) + "%"));
+        }
+    }
+
     public List<Person> findLatestActiveUsingClassicCriteria(int maxResults) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("active", true));
-        criteria.addOrder(Order.desc("createdAt"));
-        criteria.setMaxResults(maxResults);
-        return criteria.list();
+        return session().createSelectionQuery(
+                "from Person where active = true order by createdAt desc", Person.class)
+                .setMaxResults(maxResults)
+                .getResultList();
     }
 
-    /**
-     * Projection API in the old Hibernate 5 Criteria style.
-     */
-    @SuppressWarnings("deprecation")
     public long countByLastNameUsingProjection(String lastName) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("lastName", lastName));
-        criteria.setProjection(Projections.rowCount());
-        return (Long) criteria.uniqueResult();
+        return session().createSelectionQuery("select count(*) from Person where lastName = :lastName", Long.class)
+                .setParameter("lastName", lastName)
+                .getSingleResult();
     }
 
-    /**
-     * Projection + ResultTransformer is a classic Hibernate 5 migration hotspot.
-     */
-    @SuppressWarnings({"deprecation", "unchecked"})
     public List<Map<String, Object>> findProjectedActivePeople() {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Restrictions.eq("active", true));
-        criteria.setProjection(
-                Projections.projectionList()
-                        .add(Projections.property("id"), "id")
-                        .add(Projections.property("firstName"), "firstName")
-                        .add(Projections.property("lastName"), "lastName")
-                        .add(Projections.property("email"), "email")
-                        .add(Projections.property("createdAt"), "createdAt")
-        );
-        criteria.setResultTransformer(Criteria.ALIAS_TO_ENTITY_MAP);
-        return criteria.list();
+        List<Tuple> rows = session().createSelectionQuery(
+                "select id as id, firstName as firstName, lastName as lastName, email as email, "
+                        + "createdAt as createdAt from Person where active = true", Tuple.class)
+                .getResultList();
+        return rows.stream().map(row -> {
+            Map<String, Object> values = new LinkedHashMap<>();
+            row.getElements().forEach(element -> values.put(element.getAlias(), row.get(element.getAlias())));
+            return values;
+        }).toList();
     }
 
-    /**
-     * SQLRestriction is another old Hibernate-only feature.
-     */
-    @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findByEmailDomainUsingSqlRestriction(String emailDomain) {
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(
-                Restrictions.sqlRestriction(
-                        "lower({alias}.email) like ?",
-                        "%@" + emailDomain.toLowerCase(),
-                        StandardBasicTypes.STRING
-                )
-        );
-        criteria.addOrder(Order.asc("email"));
-        return criteria.list();
+        return session().createSelectionQuery(
+                "from Person where lower(email) like :domain order by email", Person.class)
+                .setParameter("domain", "%@" + emailDomain.toLowerCase(Locale.ROOT))
+                .getResultList();
     }
 
-    /**
-     * DetachedCriteria + Subqueries are strong examples of Hibernate-5 specific query code.
-     */
-    @SuppressWarnings({"deprecation", "unchecked"})
     public List<Person> findPeopleCreatedAtLatestTimestamp() {
-        DetachedCriteria latestCreatedAt = DetachedCriteria.forClass(Person.class)
-                .setProjection(Projections.max("createdAt"));
-
-        Criteria criteria = session().createCriteria(Person.class);
-        criteria.add(Subqueries.propertyEq("createdAt", latestCreatedAt));
-        return criteria.list();
+        return session().createSelectionQuery(
+                "from Person where createdAt = (select max(p.createdAt) from Person p)", Person.class)
+                .getResultList();
     }
 
-    /**
-     * HQL over the native Hibernate Session.
-     */
     public List<Person> findCreatedAfterUsingHibernateQuery(Instant createdAfter) {
-        Query<Person> query = session().createQuery(
-                "from Person p where p.createdAt >= :createdAfter order by p.createdAt desc",
-                Person.class
-        );
-
-        return query
+        return session().createSelectionQuery(
+                "from Person p where p.createdAt >= :createdAfter order by p.createdAt desc", Person.class)
                 .setParameter("createdAfter", createdAfter)
-                .list();
+                .getResultList();
     }
 
-    /**
-     * Explicit locking via Hibernate Session/LockOptions.
-     */
     @Transactional
     public Person findAndLockHibernate(Long id) {
         Person person = session().get(Person.class, id);
-
         if (person != null) {
             session().buildLockRequest(new LockOptions(LockMode.PESSIMISTIC_WRITE)).lock(person);
         }
-
         return person;
     }
 
-    /**
-     * saveOrUpdate is intentionally Hibernate-centric.
-     */
     @Transactional
     public Person saveWithHibernateSession(Person person) {
-        session().saveOrUpdate(person);
+        Person saved;
+        if (person.id == null) {
+            session().persist(person);
+            saved = person;
+        } else {
+            saved = session().merge(person);
+        }
         session().flush();
-        return person;
+        return saved;
     }
 
-    /**
-     * Hibernate HQL bulk update.
-     */
     @Transactional
     public int deactivateByCityUsingBulkHql(String city) {
-        Query<?> query = session().createQuery(
-                "update Person p set p.active = false where p.city = :city"
-        );
-
-        return query
+        return session().createMutationQuery("update Person p set p.active = false where p.city = :city")
                 .setParameter("city", city)
                 .executeUpdate();
     }
 
-    /**
-     * Hibernate HQL bulk delete.
-     */
     @Transactional
     public int deleteInactiveUsingBulkHql() {
-        Query<?> query = session().createQuery(
-                "delete from Person p where p.active = false"
-        );
-
-        return query.executeUpdate();
+        return session().createMutationQuery("delete from Person p where p.active = false")
+                .executeUpdate();
     }
 }
