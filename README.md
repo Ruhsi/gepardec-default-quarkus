@@ -4,6 +4,18 @@ This project uses Quarkus, the Supersonic Subatomic Java Framework.
 
 If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
 
+## Migration baseline
+
+This example intentionally uses Quarkus 2.16.12.Final and Hibernate ORM
+5.6.15.Final, managed by the Quarkus BOM. Use JDK 17 to build and test it.
+
+`Person` uses `javax.persistence`. `PersonRepository` includes Hibernate 5's
+legacy Criteria API, query-by-example, projections, SQL restrictions and
+`saveOrUpdate`, providing concrete cases for a later Hibernate 6 migration.
+
+Validate the baseline with `./mvnw clean test`. `PersonRepositoryTest` checks
+filtering, ordering, projections, example matching, persistence and bulk updates.
+
 ## Running the application in dev mode
 
 You can run your application in dev mode that enables live coding using:
@@ -30,7 +42,7 @@ The application is now runnable using `java -jar target/quarkus-app/quarkus-run.
 If you want to build an _über-jar_, execute the following command:
 
 ```shell script
-./mvnw package -Dquarkus.package.jar.type=uber-jar
+./mvnw package -Dquarkus.package.type=uber-jar
 ```
 
 The application, packaged as an _über-jar_, is now runnable using `java -jar target/*-runner.jar`.

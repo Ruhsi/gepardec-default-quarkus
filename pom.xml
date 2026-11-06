@@ -8,13 +8,12 @@
 
     <properties>
         <compiler-plugin.version>3.12.1</compiler-plugin.version>
-        <hibernate-core.version>6.2.18.Final</hibernate-core.version>
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
         <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
-        <quarkus.platform.version>3.2.12.Final</quarkus.platform.version>
+        <quarkus.platform.version>2.16.12.Final</quarkus.platform.version>
         <skipITs>true</skipITs>
         <surefire-plugin.version>3.2.3</surefire-plugin.version>
     </properties>
@@ -55,9 +54,8 @@
             <artifactId>quarkus-hibernate-orm-panache</artifactId>
         </dependency>
         <dependency>
-            <groupId>org.hibernate.orm</groupId>
+            <groupId>org.hibernate</groupId>
             <artifactId>hibernate-core</artifactId>
-            <version>${hibernate-core.version}</version>
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
@@ -155,7 +153,7 @@
             </activation>
             <properties>
                 <skipITs>false</skipITs>
-                <quarkus.native.enabled>true</quarkus.native.enabled>
+                <quarkus.package.type>native</quarkus.package.type>
             </properties>
         </profile>
 
